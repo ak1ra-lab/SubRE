@@ -1,0 +1,118 @@
+{
+  "cases": [
+    {
+      "name": "video-show-clean-subtitle-season-episode",
+      "videos": [
+        "[Group] Show - 01 [1080p].mkv",
+        "[Group] Show - 02 [1080p].mkv",
+        "[Group] Show - 03 [1080p].mkv"
+      ],
+      "subtitles": [
+        "Show.S01E01.chs.ass",
+        "Show.S01E02.chs.ass",
+        "Show.S01E03.chs.ass"
+      ],
+      "expected_pairs": [
+        ["[Group] Show - 01 [1080p]", "Show.S01E01.chs"],
+        ["[Group] Show - 02 [1080p]", "Show.S01E02.chs"],
+        ["[Group] Show - 03 [1080p]", "Show.S01E03.chs"]
+      ]
+    },
+    {
+      "name": "resolution-mixed-with-episode",
+      "videos": [
+        "[Group] Show - 01 [1080p].mkv",
+        "[Group] Show - 02 [720p].mkv"
+      ],
+      "subtitles": [
+        "Show.S01E01.ass",
+        "Show.S01E02.ass"
+      ],
+      "expected_pairs": [
+        ["[Group] Show - 01 [1080p]", "Show.S01E01"],
+        ["[Group] Show - 02 [720p]", "Show.S01E02"]
+      ]
+    },
+    {
+      "name": "ep-marker-prefixed",
+      "videos": [
+        "Show EP01.mkv",
+        "Show EP02.mkv",
+        "Show EP03.mkv"
+      ],
+      "subtitles": [
+        "Show.EP01.chs.ass",
+        "Show.EP02.chs.ass",
+        "Show.EP03.chs.ass"
+      ],
+      "expected_pairs": [
+        ["Show EP01", "Show.EP01.chs"],
+        ["Show EP02", "Show.EP02.chs"],
+        ["Show EP03", "Show.EP03.chs"]
+      ]
+    },
+    {
+      "name": "chinese-marker-prefix",
+      "videos": [
+        "Show 第01话.mkv",
+        "Show 第02话.mkv"
+      ],
+      "subtitles": [
+        "Show 第01话.ass",
+        "Show 第02话.ass"
+      ],
+      "expected_pairs": [
+        ["Show 第01话", "Show 第01话"],
+        ["Show 第02话", "Show 第02话"]
+      ]
+    },
+    {
+      "name": "single-video-multiple-subtitles",
+      "videos": [
+        "Show - 01.mkv"
+      ],
+      "subtitles": [
+        "Show.S01E01.chs.ass",
+        "Show.S01E01.cht.ass"
+      ],
+      "expected_pairs": [
+        ["Show - 01", "Show.S01E01.chs"],
+        ["Show - 01", "Show.S01E01.cht"]
+      ]
+    },
+    {
+      "name": "revision-marker-pairs-with-base",
+      "videos": [
+        "Show - 01.mkv"
+      ],
+      "subtitles": [
+        "Show.S01E01v2.ass"
+      ],
+      "expected_pairs": [
+        ["Show - 01", "Show.S01E01v2"]
+      ]
+    },
+    {
+      "name": "non-numeric-special",
+      "videos": [
+        "Show - NCOP.mkv"
+      ],
+      "subtitles": [
+        "Show.NCOP.ass"
+      ],
+      "expected_pairs": [
+        ["Show - NCOP", "Show.NCOP"]
+      ]
+    },
+    {
+      "name": "text-unmatched-preserved",
+      "videos": [
+        "Show - 01.mkv"
+      ],
+      "subtitles": [
+        "Show.SP01.ass"
+      ],
+      "expected_pairs": []
+    }
+  ]
+}
