@@ -434,4 +434,22 @@ mod tests {
         assert_eq!(r.groups.len(), 1);
         assert_eq!(r.groups[0].subtitles.len(), 1);
     }
+
+    #[test]
+    fn match_files_37x37_within_time_budget() {
+        // Regression guard: the cross-side alignment scorer used to
+        // recompile its episode-key regexes on every `normalize_key` call,
+        // making a 37x37 match take ~52s (release). A generous budget only
+        // trips on that class of catastrophic regression, not on slow CI.
+        let m = Matcher::new();
+        let videos: Vec<FileEntry> =
+            (1..=37).map(|i| entry(&format!("[Group] Show - {i:02} [1080p].mkv"))).collect();
+        let subtitles: Vec<FileEntry> =
+            (1..=37).map(|i| entry(&format!("Show.S01E{i:02}.chs.ass"))).collect();
+        let start = std::time::Instant::now();
+        let r = m.match_files(&videos, &subtitles, None, None);
+        let elapsed = start.elapsed();
+        assert_eq!(r.groups.len(), 37);
+        assert!(elapsed.as_secs() < 5, "37x37 match took {elapsed:?}");
+    }
 }
