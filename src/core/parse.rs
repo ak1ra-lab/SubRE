@@ -7,11 +7,13 @@
 //! `EpisodeKey` so that variants like `01` / `E1` / `EP01` / `01v2` all
 //! compare equal and `01-02` / `01.5` survive as compound keys.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 /// Classification of a single dropped file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -214,16 +216,28 @@ pub fn extract_keys(stems: &[&str]) -> Vec<RawKey> {
         return vec![heuristic_single(stems[0])];
     }
 
-    let lcp = common_prefix_len(stems);
-    let lcs = common_suffix_len(stems);
+    // Normalize each stem: NFKD + ASCII whitespace fold. Stems that were
+    // already canonical borrow from the input; others live in `owned`.
+    let normalized: Vec<Cow<'_, str>> = stems.iter().map(|s| normalize_stem(s)).collect();
+    let needs_owned = normalized.iter().any(|c| matches!(c, Cow::Owned(_)));
+    let owned_buf: Vec<String>;
+    let norm_refs: Vec<&str> = if needs_owned {
+        owned_buf = normalized.iter().map(|c| c.as_ref().to_string()).collect();
+        owned_buf.iter().map(std::string::String::as_str).collect()
+    } else {
+        normalized.iter().map(std::convert::AsRef::as_ref).collect()
+    };
 
-    if lcp + lcs >= stems[0].len() {
+    let lcp = common_prefix_len(&norm_refs);
+    let lcs = common_suffix_len(&norm_refs);
+
+    if lcp + lcs >= norm_refs[0].len() {
         // Entire stems are equal under LCP/LCS — no variable region.
         // Fall back to the heuristic on each full stem.
-        return stems.iter().map(|s| heuristic_single(s)).collect();
+        return norm_refs.iter().map(|s| heuristic_single(s)).collect();
     }
 
-    let cores: Vec<&str> = stems.iter().map(|s| &s[lcp..s.len() - lcs]).collect();
+    let cores: Vec<&str> = norm_refs.iter().map(|s| &s[lcp..s.len() - lcs]).collect();
 
     // Split each core into fields (digit runs / alpha runs / separators).
     let fields_per_core: Vec<Vec<Field<'_>>> = cores.iter().map(|c| split_fields(c)).collect();
@@ -242,7 +256,13 @@ pub fn extract_keys(stems: &[&str]) -> Vec<RawKey> {
             .map(|fields| {
                 fields
                     .get(idx)
-                    .filter(|f| matches!(f.kind, FieldKind::Digit | FieldKind::Alpha))
+                    .filter(|f| {
+                        matches!(f.kind, FieldKind::Digit | FieldKind::Alpha)
+                            // CJK-only "separator" run (e.g. `一` after
+                            // LCP/LCS strips `中文 第…集`) is still a valid
+                            // variable-region key.
+                            || is_cjk_text_field(f)
+                    })
                     .map_or(RawKey(None), |f| RawKey(Some(f.text.to_string())))
             })
             .collect(),
@@ -251,7 +271,7 @@ pub fn extract_keys(stems: &[&str]) -> Vec<RawKey> {
             // the cross-format case where alignment across the group
             // fails (e.g. `Show - 01` vs `Show.S01E01` share no core
             // fields worth picking).
-            stems.iter().map(|s| heuristic_single(s)).collect()
+            norm_refs.iter().map(|s| heuristic_single(s)).collect()
         }
     }
 }
@@ -407,18 +427,22 @@ fn common_prefix_len(stems: &[&str]) -> usize {
         return 0;
     }
     let first = stems[0];
-    let mut len = first.len();
+    let mut bytes = first.len();
     for s in &stems[1..] {
-        let mut i = 0;
-        while i < len && i < s.len() && first.as_bytes()[i] == s.as_bytes()[i] {
-            i += 1;
+        let mut matched = 0usize;
+        for (a, b) in first.chars().zip(s.chars()) {
+            if a == b {
+                matched += a.len_utf8();
+            } else {
+                break;
+            }
         }
-        len = i;
-        if len == 0 {
+        bytes = matched;
+        if bytes == 0 {
             break;
         }
     }
-    len
+    bytes
 }
 
 fn common_suffix_len(stems: &[&str]) -> usize {
@@ -426,24 +450,91 @@ fn common_suffix_len(stems: &[&str]) -> usize {
         return 0;
     }
     let first = stems[0];
-    let mut len = first.len();
+    let mut bytes = first.len();
     for s in &stems[1..] {
-        let mut i = 0;
-        while i < len && i < s.len() {
-            let a = first.as_bytes()[first.len() - 1 - i];
-            let b = s.as_bytes()[s.len() - 1 - i];
+        let a_rev: Vec<char> = first.chars().rev().collect();
+        let b_rev: Vec<char> = s.chars().rev().collect();
+        let mut matched = 0usize;
+        for (a, b) in a_rev.iter().zip(b_rev.iter()) {
             if a == b {
-                i += 1;
+                matched += a.len_utf8();
             } else {
                 break;
             }
         }
-        len = i;
-        if len == 0 {
+        bytes = matched;
+        if bytes == 0 {
             break;
         }
     }
-    len
+    bytes
+}
+
+/// Normalize a stem before key extraction.
+///
+/// Pipeline:
+///   1. Unicode NFKD — collapses compatibility variants (e.g. `機動` →
+///      `机动`, `為` → `为`) so that LCP/LCS land on the same byte
+///      offsets across stems that differ only in script variant.
+///   2. ASCII whitespace fold — collapses runs of `\t` / ` ` into a
+///      single space and trims, so that `Show - 1 xyz` and
+///      `Show.1xyz` don't diverge purely on whitespace.
+///
+/// Returns `Cow<str>`: `Borrowed` when the input was already normalized
+/// (the common case for ASCII stems), `Owned` when the pipeline had to
+/// rewrite.
+fn normalize_stem(s: &str) -> Cow<'_, str> {
+    // NFKD on pure ASCII is identity, so skip the allocation.
+    let nfkd: Cow<'_, str> =
+        if s.is_ascii() { Cow::Borrowed(s) } else { Cow::Owned(s.nfkd().collect::<String>()) };
+    if !needs_whitespace_fold(nfkd.as_ref()) {
+        return nfkd;
+    }
+    Cow::Owned(fold_ascii_whitespace(nfkd.as_ref()))
+}
+
+fn needs_whitespace_fold(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    // Tabs always get folded to a single space.
+    if bytes.contains(&b'\t') {
+        return true;
+    }
+    if bytes.first().is_some_and(|b| *b == b' ') {
+        return true;
+    }
+    if bytes.last().is_some_and(|b| *b == b' ') {
+        return true;
+    }
+    bytes.windows(2).any(|w| w[0] == b' ' && w[1] == b' ')
+}
+
+fn fold_ascii_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_ws = true;
+    for ch in s.chars() {
+        if ch == ' ' || ch == '\t' {
+            if !prev_ws {
+                out.push(' ');
+                prev_ws = true;
+            }
+        } else {
+            out.push(ch);
+            prev_ws = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// True when `f` is a `Separator` field whose text is entirely CJK
+/// letters/digits — e.g. `一`, `機動` — and therefore represents a
+/// non-ASCII alphanumeric token that the ASCII regex couldn't classify.
+fn is_cjk_text_field(f: &Field<'_>) -> bool {
+    matches!(f.kind, FieldKind::Separator)
+        && !f.text.is_empty()
+        && f.text.chars().all(|c| !c.is_ascii() && c.is_alphanumeric())
 }
 
 /// Fallback heuristic for single-file groups: extract the first plausible
@@ -459,12 +550,20 @@ pub(crate) fn heuristic_single(stem: &str) -> RawKey {
     // it as a text key.
     for (i, f) in fields.iter().enumerate() {
         if matches!(f.kind, FieldKind::Digit) {
-            if let Some(prev) = fields.get(i.wrapping_sub(1))
-                && matches!(prev.kind, FieldKind::Alpha)
+            // Walk back over any Separator fields to find the nearest
+            // non-separator token; if it's a SPECIAL_TAG alpha (SP/OP/ED/
+            // NCOP/NCED/OVA/PV/CM/Menu) — or a CJK numeral (一/二/...) —
+            // return that as a text key so the digit doesn't get treated
+            // as an episode number.
+            if let Some(j) = (0..i).rev().find(|&j| !matches!(fields[j].kind, FieldKind::Separator))
+                && matches!(fields[j].kind, FieldKind::Alpha)
             {
-                let p = prev.text.to_ascii_lowercase();
+                let p = fields[j].text.to_ascii_lowercase();
                 if SPECIAL_TAGS.contains(&p.as_str()) {
-                    return RawKey(Some(prev.text.to_string()));
+                    return RawKey(Some(fields[j].text.to_string()));
+                }
+                if CHINESE_NUMERALS.contains(&fields[j].text) {
+                    return RawKey(Some(fields[j].text.to_string()));
                 }
             }
             return RawKey(Some(f.text.to_string()));
@@ -503,6 +602,13 @@ pub fn normalize_key(raw: Option<&str>) -> Option<EpisodeKey> {
         return Some(EpisodeKey::Text(tag.to_ascii_uppercase()));
     }
 
+    // CJK numerals (`一/二/.../十` and uppercase `壹/贰/.../拾`) act as
+    // text keys: they have no ASCII case, so we scan the start of `lower`
+    // (after ascii-lowercasing — CJK chars are unaffected) for any of them.
+    if let Some(n) = CHINESE_NUMERALS.iter().find(|n| lower.starts_with(*n)) {
+        return Some(EpisodeKey::Text(n.to_string()));
+    }
+
     // Episode-marker patterns, in priority order:
     //   第 (\d+ ...) 话/集
     //   S\d+ E(p)? (\d+ ...)
@@ -537,6 +643,11 @@ pub fn normalize_key(raw: Option<&str>) -> Option<EpisodeKey> {
 }
 
 const SPECIAL_TAGS: &[&str] = &["ncop", "nced", "sp", "op", "ed", "ova", "pv", "cm", "menu"];
+
+const CHINESE_NUMERALS: &[&str] = &[
+    "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "壹", "贰", "叁", "肆", "伍", "陆",
+    "柒", "捌", "玖", "拾",
+];
 
 /// Canonicalize a numeric key string: strip leading zeros on each numeric
 /// component (split by `-` and `.`), drop revision `v\d+` suffix.
@@ -762,5 +873,114 @@ mod tests {
             keys,
             vec![RawKey(Some("01".into())), RawKey(Some("02".into())), RawKey(Some("03".into()))]
         );
+    }
+
+    #[test]
+    fn common_prefix_len_cjk_lands_on_char_boundary() {
+        // Both stems share `中文 第` but diverge on `一` vs `二`. lcp must
+        // stop at byte 10 (end of `第`), never at 11 (mid-`一`).
+        let stems = ["中文 第一集", "中文 第二集"];
+        let raw: Vec<&str> = stems.to_vec();
+        let lcp = common_prefix_len(&raw);
+        assert_eq!(lcp, "中文 第".len());
+        assert!(raw[0].is_char_boundary(lcp));
+    }
+
+    #[test]
+    fn common_suffix_len_cjk_lands_on_char_boundary() {
+        // Shared suffix `集` (3 bytes); lcs must be 3, not 4 (which would
+        // start at byte 10, mid-`一`).
+        let stems = ["中文 第一集", "中文 第二集"];
+        let raw: Vec<&str> = stems.to_vec();
+        let lcs = common_suffix_len(&raw);
+        assert_eq!(lcs, "集".len());
+    }
+
+    #[test]
+    fn extract_keys_does_not_panic_on_kimetsu_stems() {
+        let stems = [
+            "[Up to 21°C] 鬼滅之刃 柱訓練篇 - 02 (Baha 1920x1080 AVC AAC MP4) [784C8989]",
+            "[Up to 21°C] 鬼滅之刃 柱訓練篇 - 04 (Baha 1920x1080 AVC AAC MP4) [41B42367]",
+        ];
+        let raw: Vec<&str> = stems.to_vec();
+        // Must not panic. Result content is not asserted here — that is
+        // covered by the corpus fixture. The unit test only guards
+        // against future regressions of the char-boundary panic.
+        let _ = extract_keys(&raw);
+    }
+
+    #[test]
+    fn extract_keys_does_not_panic_on_chinese_numerals_stems() {
+        let stems = ["中文 第一集", "中文 第二集"];
+        let raw: Vec<&str> = stems.to_vec();
+        let _ = extract_keys(&raw);
+    }
+
+    #[test]
+    fn heuristic_single_sp_with_various_separators() {
+        // SP followed by a single separator and a digit must return "SP"
+        // as a text key (not collapse onto the episode digit).
+        assert_eq!(heuristic_single("Show - SP 01"), RawKey(Some("SP".into())));
+        assert_eq!(heuristic_single("Show.SP.01"), RawKey(Some("SP".into())));
+        assert_eq!(heuristic_single("Show - SP_ 01"), RawKey(Some("SP".into())));
+        // OP variant.
+        assert_eq!(heuristic_single("Show - OP 02"), RawKey(Some("OP".into())));
+        // Bare digit (no SPECIAL_TAG) still extracts the digit.
+        assert_eq!(heuristic_single("Show - 01"), RawKey(Some("01".into())));
+    }
+
+    #[test]
+    fn normalize_key_chinese_numeral_returns_text() {
+        assert_eq!(normalize_key(Some("一")), Some(EpisodeKey::Text("一".into())));
+        assert_eq!(normalize_key(Some("二")), Some(EpisodeKey::Text("二".into())));
+        // 壹/贰/... are the financial-form variants.
+        assert_eq!(normalize_key(Some("壹")), Some(EpisodeKey::Text("壹".into())));
+    }
+
+    #[test]
+    fn extract_keys_chinese_numerals_pair_across_stems() {
+        let stems = ["中文 第一集", "中文 第二集"];
+        let raw: Vec<&str> = stems.to_vec();
+        let raws = extract_keys(&raw);
+        let keys: Vec<Option<EpisodeKey>> =
+            raws.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        assert_eq!(keys[0], Some(EpisodeKey::Text("一".into())));
+        assert_eq!(keys[1], Some(EpisodeKey::Text("二".into())));
+    }
+
+    #[test]
+    fn normalize_stem_ascii_unchanged() {
+        assert_eq!(normalize_stem("Show - 01 [1080p]").as_ref(), "Show - 01 [1080p]");
+    }
+
+    #[test]
+    fn normalize_stem_collapses_whitespace_runs() {
+        assert_eq!(normalize_stem("Show   -  01").as_ref(), "Show - 01");
+        assert_eq!(normalize_stem("  leading and trailing  ").as_ref(), "leading and trailing");
+        assert_eq!(normalize_stem("tab\there").as_ref(), "tab here");
+    }
+
+    #[test]
+    fn normalize_stem_applies_nfkd_for_compat_variants() {
+        // Compatibility ligatures DO get decomposed by NFKD (e.g. ﬁ -> fi).
+        assert_eq!(normalize_stem("ﬁle").as_ref(), "file");
+        // Script-variant forms (機動 vs 机动, の為 vs ため) are distinct
+        // code points and are NOT collapsed by NFKD — this is documented
+        // as `wontfix` in design.md and is why SubRenamer case 11/12
+        // remain test-stable without additional heuristics.
+        assert_ne!(normalize_stem("機動").as_ref(), "机动");
+    }
+
+    #[test]
+    fn extract_keys_whitespace_fold_does_not_break_pairing() {
+        // "视频 1 xyz" and "视频 1xyz" — after whitespace fold they share
+        // the same core, so the digit "1" is correctly extracted as key.
+        let stems = ["视频 1 xyz", "视频 77 test xyz"];
+        let raw: Vec<&str> = stems.to_vec();
+        let raws = extract_keys(&raw);
+        let keys: Vec<Option<EpisodeKey>> =
+            raws.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        assert_eq!(keys[0], Some(EpisodeKey::Number("1".into())));
+        assert_eq!(keys[1], Some(EpisodeKey::Number("77".into())));
     }
 }

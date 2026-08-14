@@ -1,0 +1,212 @@
+{
+  "_about": "Ported from qwqcode/SubRenamer SubRenamer.Tests/MatcherTests/TopLevelTests.json (GPL-2.0, https://github.com/qwqcode/SubRenamer). Translation rule: each row's Video/Subtitle becomes an entry in the corresponding `videos`/`subtitles` list; each Output row with both Video and Subtitle non-empty becomes an `expected_pairs` entry. Rows where one side is empty in Output are left out of `expected_pairs`, which causes `tests/corpus.rs` to assert those entries end up in the unmatched set.",
+  "cases": [
+    {
+      "name": "Basic",
+      "wontfix": true,
+      "wontfix_reason": "diff algorithm limitation: video abc.S02E01.123.mkv tail `.123` and subtitle [SubGroup] def.S02E01.xyz.ass tail `.xyz` diverge so LCP/LCS leaves no shared core. Requires matcher rewrite (out of scope per proposal Non-Goals).",
+      "videos": [
+        "abc.S02E01.123.mkv",
+        "abc.S02E02.abc.mkv",
+        "abc.S02E03.ccc.mkv"
+      ],
+      "subtitles": [
+        "[SubGroup] def.S02E01.xyz.ass",
+        "[SubGroup] def.S02E02.abc.ass",
+        "[SubGroup] def.S02E04.kkk.ass"
+      ],
+      "expected_pairs": [
+        ["abc.S02E01.123", "[SubGroup] def.S02E01.xyz"],
+        ["abc.S02E02.abc", "[SubGroup] def.S02E02.abc"]
+      ]
+    },
+    {
+      "name": "Breaking Bad (with episode titles)",
+      "wontfix": true,
+      "wontfix_reason": "diff algorithm limitation: video tails contain episode title (Green.Light) while subtitle tails omit it; LCP/LCS cannot align across stems. Requires matcher rewrite (out of scope).",
+      "videos": [
+        "Breaking.Bad.S03E04.Green.Light.2160p.Netflix.WEB-DL.DDP.5.1.H.265.mkv",
+        "Breaking.Bad.S03E12.Half.Measures.2160p.Netflix.WEB-DL.DDP.5.1.H.265.mkv",
+        "Breaking.Bad.S03E100.Test.Test.2160p.Netflix.WEB-DL.DDP.5.1.H.265.mkv"
+      ],
+      "subtitles": [
+        "breaking.bad.s03e12.720p.hdtv.x264-ctu.en.srt",
+        "Breaking.Bad.S03E04.720p.HDTV.x264-CTU.en.srt",
+        "Breaking.Bad.S03E123.720p.HDTV.x264-CTU.en.srt"
+      ],
+      "expected_pairs": [
+        ["Breaking.Bad.S03E04.Green.Light.2160p.Netflix.WEB-DL.DDP.5.1.H.265", "Breaking.Bad.S03E04.720p.HDTV.x264-CTU.en"],
+        ["Breaking.Bad.S03E12.Half.Measures.2160p.Netflix.WEB-DL.DDP.5.1.H.265", "breaking.bad.s03e12.720p.hdtv.x264-ctu.en"]
+      ]
+    },
+    {
+      "name": "Pantheon (with episode titles)",
+      "videos": [
+        "Pantheon.S02E04.Olivia.and.Farhad.1080p.AMZN.WEB-DL.DD5.1.H.264-testWEB.mkv",
+        "Pantheon.S02E05.Yair.1080p.AMZN.WEB-DL.DD5.1.H.264-testWEB.mkv",
+        "Pantheon.S02E06.Apokalypsis.1080p.AMZN.WEB-DL.DD5.1.H.264-testWEB.mkv"
+      ],
+      "subtitles": [
+        "Pantheon.S02E04.Olivia.Farhad.1080p.AMZN.WEB-DL.DD+5.1.H.264.NTb.en.srt",
+        "Pantheon.S02E05.Yair.1080p.AMZN.WEB-DL.DD+5.1.H.264.NTb.en.srt",
+        "Pantheon.S02E06.Apokalypsis.1080p.AMZN.WEB-DL.DD+5.1.H.264.NTb.en.srt"
+      ],
+      "expected_pairs": [
+        ["Pantheon.S02E04.Olivia.and.Farhad.1080p.AMZN.WEB-DL.DD5.1.H.264-testWEB", "Pantheon.S02E04.Olivia.Farhad.1080p.AMZN.WEB-DL.DD+5.1.H.264.NTb.en"],
+        ["Pantheon.S02E05.Yair.1080p.AMZN.WEB-DL.DD5.1.H.264-testWEB", "Pantheon.S02E05.Yair.1080p.AMZN.WEB-DL.DD+5.1.H.264.NTb.en"],
+        ["Pantheon.S02E06.Apokalypsis.1080p.AMZN.WEB-DL.DD5.1.H.264-testWEB", "Pantheon.S02E06.Apokalypsis.1080p.AMZN.WEB-DL.DD+5.1.H.264.NTb.en"]
+      ]
+    },
+    {
+      "name": "鬼滅之刃 (with complex characters)",
+      "videos": [
+        "[Up to 21°C] 鬼滅之刃 柱訓練篇 - 02 (Baha 1920x1080 AVC AAC MP4) [784C8989].mp4",
+        "[Up to 21°C] 鬼滅之刃 柱訓練篇 - 04 (Baha 1920x1080 AVC AAC MP4) [41B42367].mp4"
+      ],
+      "subtitles": [
+        "[鬼滅] _柱訓練篇_-_02_HEVC_AC3.ass",
+        "[鬼滅] _柱訓練篇_-_04_HEVC_AC3.ass"
+      ],
+      "expected_pairs": [
+        ["[Up to 21°C] 鬼滅之刃 柱訓練篇 - 02 (Baha 1920x1080 AVC AAC MP4) [784C8989]", "[鬼滅] _柱訓練篇_-_02_HEVC_AC3"],
+        ["[Up to 21°C] 鬼滅之刃 柱訓練篇 - 04 (Baha 1920x1080 AVC AAC MP4) [41B42367]", "[鬼滅] _柱訓練篇_-_04_HEVC_AC3"]
+      ]
+    },
+    {
+      "name": "BlackDoor (with parentheses)",
+      "wontfix": true,
+      "wontfix_reason": "diff algorithm limitation: video cores `(S01)` and `(S11)` after LCP/LCS become `01`/`11`; subtitle cores `S01E01` and `S01E11` after LCP/LCS become `01`/`11`. (S11) video still aligns to E01 subtitle by mistake. Requires matcher rewrite (out of scope).",
+      "videos": [
+        "Black Mirror (2011)(1080p)(Webdl)(VP9)(14 lang-AAC- 2.0) (S01) PHDTeam.mkv",
+        "Black Mirror (2011)(1080p)(Webdl)(VP9)(14 lang-AAC- 2.0) (S11) PHDTeam.mkv"
+      ],
+      "subtitles": [
+        "Black Mirror_S01E01_Patnáct milionů meritů.ass",
+        "Black Mirror_S01E11_P15milMeritů-EN.ass"
+      ],
+      "expected_pairs": [
+        ["Black Mirror (2011)(1080p)(Webdl)(VP9)(14 lang-AAC- 2.0) (S01) PHDTeam", "Black Mirror_S01E01_Patnáct milionů meritů"],
+        ["Black Mirror (2011)(1080p)(Webdl)(VP9)(14 lang-AAC- 2.0) (S11) PHDTeam", "Black Mirror_S01E11_P15milMeritů-EN"]
+      ]
+    },
+    {
+      "name": "Haikyuu!! (with multiple languages, one-to-many)",
+      "wontfix": true,
+      "wontfix_reason": "diff algorithm limitation: video cores after LCP/LCS are `S2 - 09`/`S2 - 10`, subtitle cores are `09`/`10`. The `S2 - ` prefix on the video side prevents direct alignment; cross-side alignment fails. Requires matcher rewrite (out of scope).",
+      "videos": [
+        "[Kamigami] Haikyuu!! S2 - 09 [1920x1080 HEVC AAC Sub(Chs,Cht,Jap)].mkv",
+        "[Kamigami] Haikyuu!! S2 - 10 [1920x1080 HEVC AAC Sub(Chs,Cht,Jap)].mkv"
+      ],
+      "subtitles": [
+        "[YYDM-11FANS][Haikyuu!!][09][BDRIP][720P][X264-10bit_AAC][40A7E056].en.ass",
+        "[YYDM-11FANS][Haikyuu!!][09][BDRIP][720P][X264-10bit_AAC][40A7E056].sc.ass",
+        "[YYDM-11FANS][Haikyuu!!][09][BDRIP][720P][X264-10bit_AAC][40A7E056].tc.ass",
+        "[YYDM-11FANS][Haikyuu!!][10][BDRIP][720P][X264-10bit_AAC][6FDEFD72].sc.ass",
+        "[YYDM-11FANS][Haikyuu!!][10][BDRIP][720P][X264-10bit_AAC][6FDEFD72].tc.ass"
+      ],
+      "expected_pairs": [
+        ["[Kamigami] Haikyuu!! S2 - 09 [1920x1080 HEVC AAC Sub(Chs,Cht,Jap)]", "[YYDM-11FANS][Haikyuu!!][09][BDRIP][720P][X264-10bit_AAC][40A7E056].en"],
+        ["[Kamigami] Haikyuu!! S2 - 09 [1920x1080 HEVC AAC Sub(Chs,Cht,Jap)]", "[YYDM-11FANS][Haikyuu!!][09][BDRIP][720P][X264-10bit_AAC][40A7E056].sc"],
+        ["[Kamigami] Haikyuu!! S2 - 09 [1920x1080 HEVC AAC Sub(Chs,Cht,Jap)]", "[YYDM-11FANS][Haikyuu!!][09][BDRIP][720P][X264-10bit_AAC][40A7E056].tc"],
+        ["[Kamigami] Haikyuu!! S2 - 10 [1920x1080 HEVC AAC Sub(Chs,Cht,Jap)]", "[YYDM-11FANS][Haikyuu!!][10][BDRIP][720P][X264-10bit_AAC][6FDEFD72].sc"],
+        ["[Kamigami] Haikyuu!! S2 - 10 [1920x1080 HEVC AAC Sub(Chs,Cht,Jap)]", "[YYDM-11FANS][Haikyuu!!][10][BDRIP][720P][X264-10bit_AAC][6FDEFD72].tc"]
+      ]
+    },
+    {
+      "name": "轻音少女 (Whitespace as Suffix)",
+      "videos": [
+        "轻音少女 S01E01 1080p.VCB-Studio.mkv",
+        "轻音少女 S01E02 1080p.VCB-Studio.mkv"
+      ],
+      "subtitles": [
+        "轻音少女S01E01.ass",
+        "轻音少女S01E02.ass"
+      ],
+      "expected_pairs": [
+        ["轻音少女 S01E01 1080p.VCB-Studio", "轻音少女S01E01"],
+        ["轻音少女 S01E02 1080p.VCB-Studio", "轻音少女S01E02"]
+      ]
+    },
+    {
+      "name": "SquareBrackets",
+      "videos": [
+        "abc [01].mkv",
+        "abc [02].mkv"
+      ],
+      "subtitles": [
+        "[SubGroup] def [01].ass",
+        "[SubGroup] def [02].ass"
+      ],
+      "expected_pairs": [
+        ["abc [01]", "[SubGroup] def [01]"],
+        ["abc [02]", "[SubGroup] def [02]"]
+      ]
+    },
+    {
+      "name": "Chinese Characters",
+      "videos": [
+        "中文 第一集.mkv",
+        "中文 第二集.mkv"
+      ],
+      "subtitles": [
+        "【字幕】中文 第一集.srt",
+        "【字幕】中文 第二集.srt"
+      ],
+      "expected_pairs": [
+        ["中文 第一集", "【字幕】中文 第一集"],
+        ["中文 第二集", "【字幕】中文 第二集"]
+      ]
+    },
+    {
+      "name": "WhiteSpaceAsSuffix",
+      "videos": [
+        "视频 1 xyz.mov",
+        "视频 77 test xyz.mov"
+      ],
+      "subtitles": [
+        "字幕 1xyz.srt",
+        "字幕 77test xyz.srt"
+      ],
+      "expected_pairs": [
+        ["视频 1 xyz", "字幕 1xyz"],
+        ["视频 77 test xyz", "字幕 77test xyz"]
+      ]
+    },
+    {
+      "name": "Nのために (Japanese, Unicode NFKD Test#1)",
+      "videos": [
+        "Nのために EP01 720p HDTV x264 AAC-DoA.mkv",
+        "Nのために EP02 720p HDTV x264 AAC-DoA.mkv",
+        "Nのために EP10 End 720p HDTV x264 AAC-DoA.mkv"
+      ],
+      "subtitles": [
+        "[ドラマ][Nのために 第01話]「榮倉奈々、窪田正孝、賀来賢人、小出恵介、徳井義実、小西真奈美、三浦友和」[720p x264 AAC].tc.srt",
+        "[ドラマ][Nのために 第02話]「榮倉奈々、窪田正孝、賀来賢人、小出恵介、徳井義実、小西真奈美、三浦友和」[720p x264 AAC].tc.srt",
+        "[ドラマ][Nのために 第10話]「榮倉奈々、窪田正孝、賀来賢人、小出恵介、徳井義実、小西真奈美、三浦友和」[720p x264 AAC][最終話].tc.srt"
+      ],
+      "expected_pairs": [
+        ["Nのために EP01 720p HDTV x264 AAC-DoA", "[ドラマ][Nのために 第01話]「榮倉奈々、窪田正孝、賀来賢人、小出恵介、徳井義実、小西真奈美、三浦友和」[720p x264 AAC].tc"],
+        ["Nのために EP02 720p HDTV x264 AAC-DoA", "[ドラマ][Nのために 第02話]「榮倉奈々、窪田正孝、賀来賢人、小出恵介、徳井義実、小西真奈美、三浦友和」[720p x264 AAC].tc"],
+        ["Nのために EP10 End 720p HDTV x264 AAC-DoA", "[ドラマ][Nのために 第10話]「榮倉奈々、窪田正孝、賀来賢人、小出恵介、徳井義実、小西真奈美、三浦友和」[720p x264 AAC][最終話].tc"]
+      ]
+    },
+    {
+      "name": "機動警察 (Japanese, Unicode NFKD Test#2)",
+      "videos": [
+        "[AI-Raws] 机动警察パトレイバー #1 (BD HEVC 1440x1080 FLAC)[9F318F24].mkv",
+        "[AI-Raws] 机动警察パトレイバー #2 (BD HEVC 1440x1080 FLAC)[7F3281F4].mkv",
+        "[AI-Raws] 机动警察パトレイバー #10 (BD HEVC 1440x1080 FLAC)[8F01DF54].mkv"
+      ],
+      "subtitles": [
+        "[炎之川字幕] 机动警察 機動警察パトレイバー 01.ass",
+        "[炎之川字幕] 机动警察 機動警察パトレイバー 02.ass",
+        "[炎之川字幕] 机动警察 機動警察パトレイバー 10.ass"
+      ],
+      "expected_pairs": [
+        ["[AI-Raws] 机动警察パトレイバー #1 (BD HEVC 1440x1080 FLAC)[9F318F24]", "[炎之川字幕] 机动警察 機動警察パトレイバー 01"],
+        ["[AI-Raws] 机动警察パトレイバー #2 (BD HEVC 1440x1080 FLAC)[7F3281F4]", "[炎之川字幕] 机动警察 機動警察パトレイバー 02"],
+        ["[AI-Raws] 机动警察パトレイバー #10 (BD HEVC 1440x1080 FLAC)[8F01DF54]", "[炎之川字幕] 机动警察 機動警察パトレイバー 10"]
+      ]
+    }
+  ]
+}

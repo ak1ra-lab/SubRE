@@ -113,6 +113,24 @@
         "Show.SP01.ass"
       ],
       "expected_pairs": []
+    },
+    {
+      "name": "death-note-sp-pair",
+      "videos": [
+        "Death_Note - 01.mp4",
+        "Death_Note - 02.mp4",
+        "Death_Note - SP 01.mp4"
+      ],
+      "subtitles": [
+        "Death_Note - 01.ass",
+        "Death_Note - 02.ass",
+        "Death_Note - SP 01.ass"
+      ],
+      "expected_pairs": [
+        ["Death_Note - 01", "Death_Note - 01"],
+        ["Death_Note - 02", "Death_Note - 02"],
+        ["Death_Note - SP 01", "Death_Note - SP 01"]
+      ]
     }
   ]
 }
