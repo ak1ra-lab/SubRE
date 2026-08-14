@@ -4,8 +4,10 @@
 //! or copies. Errors are collected per-op and returned in [`ExecuteReport`]
 //! so a partial failure does not abort the run.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -97,6 +99,38 @@ pub fn sha256_hex(path: &Path) -> std::io::Result<String> {
         let _ = write!(s, "{byte:02x}");
     }
     Ok(s)
+}
+
+/// Memoized SHA-256 cache keyed by `(path, mtime, size)` so that unchanged
+/// files are not re-read and re-hashed on every refresh.
+#[derive(Debug, Default)]
+pub struct ChecksumCache {
+    entries: HashMap<PathBuf, (SystemTime, u64, String)>,
+}
+
+impl ChecksumCache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return the cached SHA-256 for `path`, recomputing (and caching) it
+    /// only when the file's `(mtime, size)` changed since the last call.
+    /// Returns `None` when the file cannot be read or its metadata fetched.
+    pub fn cached_sha256(&mut self, path: &Path) -> Option<String> {
+        let meta = fs::metadata(path).ok()?;
+        let mtime = meta.modified().ok()?;
+        let size = meta.len();
+        if let Some((cached_mtime, cached_size, checksum)) = self.entries.get(path)
+            && *cached_mtime == mtime
+            && *cached_size == size
+        {
+            return Some(checksum.clone());
+        }
+        let checksum = sha256_hex(path).ok()?;
+        self.entries.insert(path.to_path_buf(), (mtime, size, checksum.clone()));
+        Some(checksum)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +386,40 @@ mod tests {
         // Neither member may be renamed (whole unit skipped).
         assert!(idx_new.exists());
         assert!(sub_new.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checksum_cache_reuses_unchanged_file() {
+        let dir = tmpdir("checksum_cache_hit");
+        let f = dir.join("a.ass");
+        write(&f, b"hello");
+        let mut cache = ChecksumCache::new();
+        let first = cache.cached_sha256(&f).unwrap();
+        let second = cache.cached_sha256(&f).unwrap();
+        assert_eq!(first, second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checksum_cache_invalidates_on_size_change() {
+        let dir = tmpdir("checksum_cache_size");
+        let f = dir.join("b.ass");
+        write(&f, b"hello");
+        let mut cache = ChecksumCache::new();
+        let first = cache.cached_sha256(&f).unwrap();
+        write(&f, b"hello world");
+        let second = cache.cached_sha256(&f).unwrap();
+        assert_ne!(first, second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checksum_cache_missing_file_returns_none() {
+        let dir = tmpdir("checksum_cache_missing");
+        let f = dir.join("missing.ass");
+        let mut cache = ChecksumCache::new();
+        assert!(cache.cached_sha256(&f).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

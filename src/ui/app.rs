@@ -24,20 +24,22 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use eframe::egui;
 use egui_extras::TableBuilder;
 
 use crate::core::config::{ConfigStore, UserConfig};
 use crate::core::execute::{
-    ExecuteReport, OpOutcome, RollbackItem, RollbackOutcome, execute_plan, rollback_unit,
-    sha256_hex,
+    ChecksumCache, ExecuteReport, OpOutcome, RollbackItem, RollbackOutcome, execute_plan,
+    rollback_unit, sha256_hex,
 };
 use crate::core::history::{HistoryDb, RenameRecord};
 use crate::core::matcher::{FileEntry, MatchResult, Matcher, PairGroup};
 use crate::core::parse::{ExtensionRegistry, FileCategory};
 use crate::core::plan::{
-    ActionMode, Conflict, Plan, PlannedAction, PlannedOp, SuffixConfig, generate_plan,
+    ActionMode, Conflict, Plan, PlannedAction, PlannedOp, StdFsProbe, SuffixConfig, generate_plan,
 };
 
 /// Which side a path should be ingested onto when the user explicitly
@@ -46,6 +48,26 @@ use crate::core::plan::{
 pub enum ForcedSide {
     Video,
     Subtitle,
+}
+
+/// Snapshot of state sent to the background worker for a refresh.
+struct RefreshRequest {
+    videos: Vec<FileEntry>,
+    subtitles: Vec<FileEntry>,
+    video_regex: Option<String>,
+    subtitle_regex: Option<String>,
+    suffix: SuffixConfig,
+    action_mode: ActionMode,
+    epoch: u64,
+}
+
+/// Result produced by the background worker for a single refresh.
+struct RefreshResult {
+    epoch: u64,
+    result: MatchResult,
+    plan: Plan,
+    /// Per-subtitle `(dir, checksum)` identities for history attribution.
+    identities: Vec<(PathBuf, String)>,
 }
 
 /// Top-level GUI state.
@@ -99,6 +121,18 @@ pub struct App {
     pub sidebar_video_rect: Option<egui::Rect>,
     /// Rect of the Subtitle source `CollapsingHeader` in the sidebar.
     pub sidebar_subtitle_rect: Option<egui::Rect>,
+
+    // Async refresh plumbing.
+    refresh_tx: mpsc::Sender<RefreshRequest>,
+    refresh_rx: mpsc::Receiver<RefreshResult>,
+    /// Monotonic counter of the most recently requested refresh; results
+    /// carrying a stale epoch are discarded (latest-wins).
+    refresh_epoch: u64,
+    /// True while a result for the current epoch is still in flight.
+    refresh_pending: bool,
+    /// One-shot summary of the last Apply/undo run, appended to the next
+    /// refresh's status message so it survives the async round-trip.
+    result_note: Option<String>,
 }
 
 impl App {
@@ -110,6 +144,7 @@ impl App {
         for ext in &config.custom_subtitle_exts {
             registry.add_custom_subtitle(ext);
         }
+        let (refresh_tx, refresh_rx) = spawn_refresh_worker();
         Self {
             global_suffix_input: config.suffix.global.clone(),
             auto_extract_toggle: config.suffix.auto_extract_language_token,
@@ -139,6 +174,11 @@ impl App {
             checksum_collision: Vec::new(),
             sidebar_video_rect: None,
             sidebar_subtitle_rect: None,
+            refresh_tx,
+            refresh_rx,
+            refresh_epoch: 0,
+            refresh_pending: false,
+            result_note: None,
         }
     }
 
@@ -193,50 +233,67 @@ impl App {
         }
     }
 
-    /// Re-run matcher + plan from current state.
+    /// Re-run matcher + plan from current state. The expensive work
+    /// (matching, checksum hashing, plan generation) runs on a background
+    /// thread; results are applied by [`App::drain_refresh`] when they
+    /// arrive. Latest-wins: a newer request supersedes an older one.
     pub fn refresh_match_and_plan(&mut self) {
-        let matcher = Matcher::new();
-        let v_regex = non_empty(&self.video_regex_input);
-        let s_regex = non_empty(&self.subtitle_regex_input);
-        let result = matcher.match_files(
-            &self.video_entries,
-            &self.subtitle_entries,
-            v_regex.as_deref(),
-            s_regex.as_deref(),
-        );
+        self.refresh_epoch = self.refresh_epoch.wrapping_add(1);
+        let request = RefreshRequest {
+            videos: self.video_entries.clone(),
+            subtitles: self.subtitle_entries.clone(),
+            video_regex: non_empty(&self.video_regex_input),
+            subtitle_regex: non_empty(&self.subtitle_regex_input),
+            suffix: self.current_suffix_config(),
+            action_mode: self.action_mode,
+            epoch: self.refresh_epoch,
+        };
+        if self.refresh_tx.send(request).is_ok() {
+            self.refresh_pending = true;
+            self.status_message = "处理中…".into();
+        } else {
+            self.status_message = "后台刷新线程不可用".into();
+        }
+    }
 
-        // History hint: checksum-based provenance of dropped subtitles.
-        self.refresh_history_hint();
+    /// Drain any completed background refresh results for this frame,
+    /// applying only the one matching the current epoch.
+    fn drain_refresh(&mut self) {
+        let mut applied = false;
+        while let Ok(res) = self.refresh_rx.try_recv() {
+            if res.epoch == self.refresh_epoch {
+                self.apply_refresh_result(res);
+                applied = true;
+            }
+            // Stale results (older epoch) are discarded.
+        }
+        if applied {
+            self.refresh_pending = false;
+        }
+    }
 
-        let suffix = self.current_suffix_config();
-        let plan =
-            generate_plan(&result, &suffix, &crate::core::plan::StdFsProbe, self.action_mode);
-        self.match_result = Some(result);
-        self.plan = Some(plan);
+    /// Commit a completed refresh result to the UI state.
+    fn apply_refresh_result(&mut self, res: RefreshResult) {
+        self.match_result = Some(res.result);
+        self.plan = Some(res.plan);
+        self.apply_history_hint(res.identities);
         let n_groups = self.match_result.as_ref().map_or(0, |m| m.paired().count());
         let n_subs = self.subtitle_entries.len();
         let n_vids = self.video_entries.len();
-        self.status_message =
-            format!("{n_vids} video(s), {n_subs} subtitle(s) → {n_groups} pair group(s)");
+        let counts = format!("{n_vids} video(s), {n_subs} subtitle(s) → {n_groups} pair group(s)");
+        self.status_message = match self.result_note.take() {
+            Some(note) => format!("{note} · {counts}"),
+            None => counts,
+        };
     }
 
-    /// Recompute the drag-in history hint and collision warnings from the
-    /// current subtitle entries: hash each subtitle's content and look up
-    /// its `(dir, checksum)` naming history. Same-dir duplicates (content
-    /// collisions) are flagged and excluded from attribution.
-    fn refresh_history_hint(&mut self) {
+    /// Rebuild the drag-in history hint and collision warnings from the
+    /// per-subtitle `(dir, checksum)` identities computed by the worker:
+    /// look up each identity's naming history, flagging same-dir duplicates
+    /// (content collisions) and excluding them from attribution.
+    fn apply_history_hint(&mut self, identities: Vec<(PathBuf, String)>) {
         self.history_hint.clear();
         self.checksum_collision.clear();
-
-        let mut identities: Vec<(PathBuf, String)> = Vec::new();
-        for sub in &self.subtitle_entries {
-            let Some(dir) = sub.path.parent().map(Path::to_path_buf) else {
-                continue;
-            };
-            if let Ok(cs) = sha256_hex(&sub.path) {
-                identities.push((dir, cs));
-            }
-        }
 
         let mut counts: HashMap<(PathBuf, String), usize> = HashMap::new();
         for (dir, cs) in &identities {
@@ -284,6 +341,10 @@ impl App {
     /// Apply the current plan. Synchronous, but errors per op are
     /// collected into a report rather than aborting the whole run.
     pub fn apply(&mut self) {
+        if self.refresh_pending {
+            self.status_message = "处理中,请稍候再执行。".into();
+            return;
+        }
         let plan = match self.plan.clone() {
             Some(p) if !p.has_conflicts() && !p.ops.is_empty() => p,
             _ => {
@@ -354,7 +415,7 @@ impl App {
         }
         let ok = report.outcomes.iter().filter(|o| o.success).count();
         let bad = report.outcomes.iter().filter(|o| !o.success).count();
-        self.status_message = format!("Executed: {ok} ok, {bad} failed");
+        self.result_note = Some(format!("Executed: {ok} ok, {bad} failed"));
         self.refresh_match_and_plan();
     }
 
@@ -383,6 +444,10 @@ impl App {
 
     /// Undo an entire session by id.
     pub fn undo_session(&mut self, session_id: i64) {
+        if self.refresh_pending {
+            self.status_message = "处理中,请稍候再还原。".into();
+            return;
+        }
         let renames = match self.history.renames_for_session(session_id) {
             Ok(r) => r,
             Err(e) => {
@@ -443,7 +508,7 @@ impl App {
                 _ => bad += 1,
             }
         }
-        self.status_message = format!("Undo: {ok} unit(s) ok, {bad} failed");
+        self.result_note = Some(format!("Undo: {ok} unit(s) ok, {bad} failed"));
         self.refresh_match_and_plan();
     }
 
@@ -616,8 +681,8 @@ impl App {
 
             // Right-to-left cluster: Apply is rightmost (highest weight).
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let can_apply =
-                    self.plan.as_ref().is_some_and(|p| !p.ops.is_empty() && !p.has_conflicts());
+                let can_apply = !self.refresh_pending
+                    && self.plan.as_ref().is_some_and(|p| !p.ops.is_empty() && !p.has_conflicts());
 
                 if ui
                     .add_enabled(
@@ -962,6 +1027,39 @@ impl App {
 // Module-level helpers
 // ---------------------------------------------------------------------------
 
+/// Spawn the single background refresh worker. Returns the request sender
+/// (owned by `App`) and the result receiver (also owned by `App`). The
+/// worker owns a [`ChecksumCache`] so unchanged subtitles are hashed only
+/// once across refreshes.
+fn spawn_refresh_worker() -> (mpsc::Sender<RefreshRequest>, mpsc::Receiver<RefreshResult>) {
+    let (req_tx, req_rx) = mpsc::channel::<RefreshRequest>();
+    let (res_tx, res_rx) = mpsc::channel::<RefreshResult>();
+    std::thread::spawn(move || {
+        let mut cache = ChecksumCache::new();
+        while let Ok(req) = req_rx.recv() {
+            let result = Matcher::new().match_files(
+                &req.videos,
+                &req.subtitles,
+                req.video_regex.as_deref(),
+                req.subtitle_regex.as_deref(),
+            );
+            let plan = generate_plan(&result, &req.suffix, &StdFsProbe, req.action_mode);
+            let mut identities = Vec::new();
+            for sub in &req.subtitles {
+                if let Some(dir) = sub.path.parent()
+                    && let Some(cs) = cache.cached_sha256(&sub.path)
+                {
+                    identities.push((dir.to_path_buf(), cs));
+                }
+            }
+            if res_tx.send(RefreshResult { epoch: req.epoch, result, plan, identities }).is_err() {
+                break;
+            }
+        }
+    });
+    (req_tx, res_rx)
+}
+
 fn non_empty(s: &str) -> Option<String> {
     let t = s.trim();
     if t.is_empty() { None } else { Some(t.to_string()) }
@@ -1123,6 +1221,9 @@ fn shell_quote(s: &str) -> String {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Apply any completed background refresh before rendering.
+        self.drain_refresh();
+
         // Reset sidebar rects each frame; they're repopulated by
         // `render_sidebar` below.
         self.sidebar_video_rect = None;
@@ -1156,5 +1257,11 @@ impl eframe::App for App {
 
         // Modals live on ctx so they survive panel restructuring.
         self.render_modals(ui.ctx());
+
+        // Keep polling while a refresh is in flight so the UI stays
+        // responsive and the result is applied promptly.
+        if self.refresh_pending {
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        }
     }
 }
