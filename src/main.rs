@@ -24,6 +24,11 @@ fn main() -> eframe::Result<()> {
             if let Some(msg) = font_notice {
                 app.status_message = msg;
             }
+            // Non-recursively scan the working directory and preload any
+            // recognized video/subtitle files found there.
+            if let Ok(cwd) = std::env::current_dir() {
+                app.ingest_dir_auto(&cwd);
+            }
             Ok(Box::new(app))
         }),
     )

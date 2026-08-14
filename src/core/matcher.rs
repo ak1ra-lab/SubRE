@@ -17,7 +17,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::parse::{EpisodeKey, RawKey, extract_keys, extract_keys_cross, normalize_key};
+use super::parse::{
+    EpisodeKey, ExtensionRegistry, FileCategory, RawKey, extract_keys, extract_keys_cross,
+    normalize_key,
+};
 
 /// A single file dropped into the app.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +290,32 @@ fn heuristic_keys(files: &[FileEntry]) -> Vec<Option<EpisodeKey>> {
         .collect()
 }
 
+/// Collect recognized media files from `dir` non-recursively, classifying
+/// each by extension via `registry`. Returns `(videos, subtitles)`; files
+/// with unknown extensions are skipped and subdirectories are not descended.
+pub fn collect_media_files(
+    registry: &ExtensionRegistry,
+    dir: &std::path::Path,
+) -> (Vec<FileEntry>, Vec<FileEntry>) {
+    let mut videos = Vec::new();
+    let mut subtitles = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return (videos, subtitles);
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        match registry.categorize(&path) {
+            FileCategory::Video => videos.push(FileEntry::from_path(path)),
+            FileCategory::Subtitle => subtitles.push(FileEntry::from_path(path)),
+            FileCategory::Unknown => {}
+        }
+    }
+    (videos, subtitles)
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -451,5 +480,32 @@ mod tests {
         let elapsed = start.elapsed();
         assert_eq!(r.groups.len(), 37);
         assert!(elapsed.as_secs() < 5, "37x37 match took {elapsed:?}");
+    }
+
+    #[test]
+    fn collect_media_files_nonrecursive_classifies() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "sr_scan_{}_{}_{}",
+            std::process::id(),
+            n,
+            std::thread::current().name().unwrap_or("main")
+        ));
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.join("a.mkv"), b"v").unwrap();
+        std::fs::write(dir.join("b.ass"), b"s").unwrap();
+        std::fs::write(dir.join("c.txt"), b"x").unwrap();
+        std::fs::write(nested.join("d.mkv"), b"v").unwrap();
+
+        let reg = ExtensionRegistry::new();
+        let (videos, subtitles) = collect_media_files(&reg, &dir);
+        assert_eq!(videos.len(), 1);
+        assert_eq!(subtitles.len(), 1);
+        assert_eq!(videos[0].stem, "a");
+        assert_eq!(subtitles[0].stem, "b");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

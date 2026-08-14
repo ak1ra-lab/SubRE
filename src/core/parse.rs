@@ -167,6 +167,34 @@ impl ExtensionRegistry {
         &self.custom_subtitle
     }
 
+    /// All recognized video extensions (built-in + custom), sorted for
+    /// deterministic display/filtering.
+    #[must_use]
+    pub fn video_exts(&self) -> Vec<&str> {
+        let mut exts: Vec<&str> = self
+            .video
+            .iter()
+            .map(String::as_str)
+            .chain(self.custom_video.iter().map(String::as_str))
+            .collect();
+        exts.sort_unstable();
+        exts
+    }
+
+    /// All recognized subtitle extensions (built-in + custom), sorted for
+    /// deterministic display/filtering.
+    #[must_use]
+    pub fn subtitle_exts(&self) -> Vec<&str> {
+        let mut exts: Vec<&str> = self
+            .subtitle
+            .iter()
+            .map(String::as_str)
+            .chain(self.custom_subtitle.iter().map(String::as_str))
+            .collect();
+        exts.sort_unstable();
+        exts
+    }
+
     /// Classify a path by its final extension.
     pub fn categorize(&self, path: &Path) -> FileCategory {
         let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
@@ -1068,6 +1096,19 @@ mod tests {
         assert_eq!(reg.categorize(Path::new("show.mkv")), FileCategory::Video);
         assert_eq!(reg.categorize(Path::new("show.ass")), FileCategory::Subtitle);
         assert_eq!(reg.categorize(Path::new("show.txt")), FileCategory::Unknown);
+    }
+
+    #[test]
+    fn extension_registry_exts_merge_builtin_and_custom() {
+        let mut reg = ExtensionRegistry::new();
+        assert!(reg.video_exts().contains(&"mkv"));
+        assert!(!reg.video_exts().contains(&"ass"));
+        assert!(reg.subtitle_exts().contains(&"ass"));
+        assert!(!reg.subtitle_exts().contains(&"mkv"));
+        reg.add_custom_video("m4v2");
+        reg.add_custom_subtitle("ass2");
+        assert!(reg.video_exts().contains(&"m4v2"));
+        assert!(reg.subtitle_exts().contains(&"ass2"));
     }
 
     #[test]

@@ -2,10 +2,9 @@
 //!
 //! Layout (eframe 4-zone):
 //!   - `SidePanel`: two `CollapsingHeader`s (`📁 Video source` /
-//!     `📁 Subtitle source`) with Browse / Clear buttons; their rects
-//!     are captured each frame so the drop router can force-side drops
-//!     landing on them. A `🗑 Clear all` button at the bottom clears
-//!     both sides + unknowns + history hint.
+//!     `📁 Subtitle source`) with filtered Browse / Clear buttons, plus
+//!     a `📁 Browse (Auto)…` entry (files or folder, auto-classified)
+//!     and a `🗑 Clear all` button at the bottom.
 //!   - `TopBottomPanel::top` (toolbar): `Action:` `ComboBox` on the left,
 //!     `▶ Apply` (green, rightmost), `📜 History`, `⚙ Settings`,
 //!     `📋 Copy mv` packed right-to-left.
@@ -16,10 +15,6 @@
 //!   - `CentralPanel`: history hint banner (if any), inline `⚙ Settings`
 //!     collapsing header, three-column `TableBuilder`,
 //!     `Unmatched / unknown` collapsing.
-//!
-//! Drop handling is centralized in [`App::process_drops`]: it runs
-//! between sidebar render (which populates `sidebar_video_rect` /
-//! `sidebar_subtitle_rect`) and toolbar render.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -36,14 +31,14 @@ use crate::core::execute::{
     rollback_unit, sha256_hex,
 };
 use crate::core::history::{HistoryDb, RenameRecord};
-use crate::core::matcher::{FileEntry, MatchResult, Matcher, PairGroup};
+use crate::core::matcher::{FileEntry, MatchResult, Matcher, PairGroup, collect_media_files};
 use crate::core::parse::{ExtensionRegistry, FileCategory};
 use crate::core::plan::{
     ActionMode, Conflict, Plan, PlannedAction, PlannedOp, StdFsProbe, SuffixConfig, generate_plan,
 };
 
 /// Which side a path should be ingested onto when the user explicitly
-/// picks `Browse…` or drops onto a sidebar source region.
+/// picks `Browse…`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForcedSide {
     Video,
@@ -115,13 +110,6 @@ pub struct App {
     /// side (content collision), for which history is not attributed.
     pub checksum_collision: Vec<(PathBuf, String)>,
 
-    /// Rect of the Video source `CollapsingHeader` in the sidebar,
-    /// captured each frame so the drop router can detect "drop on
-    /// Video source" via `pointer.hover_pos()`.
-    pub sidebar_video_rect: Option<egui::Rect>,
-    /// Rect of the Subtitle source `CollapsingHeader` in the sidebar.
-    pub sidebar_subtitle_rect: Option<egui::Rect>,
-
     // Async refresh plumbing.
     refresh_tx: mpsc::Sender<RefreshRequest>,
     refresh_rx: mpsc::Receiver<RefreshResult>,
@@ -165,15 +153,13 @@ impl App {
             unknown_entries: Vec::new(),
             match_result: None,
             plan: None,
-            status_message: String::from("Drop files or a folder into the window to start."),
+            status_message: String::from("Use Browse to load files, or start from a media folder."),
             show_confirm: false,
             show_history: false,
             show_settings: false,
             history_hint: Vec::new(),
             undo_selection: HashMap::new(),
             checksum_collision: Vec::new(),
-            sidebar_video_rect: None,
-            sidebar_subtitle_rect: None,
             refresh_tx,
             refresh_rx,
             refresh_epoch: 0,
@@ -182,9 +168,8 @@ impl App {
         }
     }
 
-    /// Ingest a list of dropped paths: classify by extension and recurse
-    /// into folders. Used for drops that land outside the sidebar source
-    /// regions (auto-classify).
+    /// Ingest a list of paths: classify by extension and recurse into
+    /// folders. Used by the `Browse (Auto)…` file picker.
     pub fn ingest_paths<I>(&mut self, paths: I)
     where
         I: IntoIterator<Item = PathBuf>,
@@ -196,9 +181,7 @@ impl App {
     }
 
     /// Ingest paths and force them onto a specific side, bypassing the
-    /// extension-based categorizer. Used by sidebar `Browse…` buttons
-    /// and by the drop router when a drop lands on a sidebar source
-    /// rect.
+    /// extension-based categorizer. Used by the per-side `Browse…` buttons.
     pub fn ingest_paths_as<I>(&mut self, paths: I, side: ForcedSide)
     where
         I: IntoIterator<Item = PathBuf>,
@@ -231,6 +214,20 @@ impl App {
             FileCategory::Subtitle => self.subtitle_entries.push(entry),
             FileCategory::Unknown => self.unknown_entries.push(entry),
         }
+    }
+
+    /// Ingest a directory non-recursively, classifying each file by
+    /// extension via the registry. Used by the `Browse folder…` button and
+    /// the CLI startup scan. Does nothing when the directory holds no
+    /// recognized media.
+    pub fn ingest_dir_auto(&mut self, dir: &Path) {
+        let (videos, subtitles) = collect_media_files(&self.registry, dir);
+        if videos.is_empty() && subtitles.is_empty() {
+            return;
+        }
+        self.video_entries.extend(videos);
+        self.subtitle_entries.extend(subtitles);
+        self.refresh_match_and_plan();
     }
 
     /// Re-run matcher + plan from current state. The expensive work
@@ -513,42 +510,6 @@ impl App {
     }
 
     // -----------------------------------------------------------------
-    // Drop router
-    // -----------------------------------------------------------------
-
-    /// Route any dropped files for this frame. Called after the
-    /// `SidePanel` has rendered (so the source rects are populated) and
-    /// before the toolbar renders. Drops whose pointer position lands
-    /// on a sidebar source rect are routed to that side; everything
-    /// else falls through to extension auto-classify via
-    /// [`App::ingest_paths`].
-    fn process_drops(&mut self, ctx: &egui::Context) {
-        let video_rect = self.sidebar_video_rect;
-        let subtitle_rect = self.sidebar_subtitle_rect;
-        let (paths, hover) = ctx.input(|i| {
-            let paths: Vec<PathBuf> =
-                i.raw.dropped_files.iter().filter_map(|d| d.path.clone()).collect();
-            (paths, i.pointer.hover_pos())
-        });
-        if paths.is_empty() {
-            return;
-        }
-        let forced = hover.and_then(|p| {
-            if video_rect.is_some_and(|r| r.contains(p)) {
-                Some(ForcedSide::Video)
-            } else if subtitle_rect.is_some_and(|r| r.contains(p)) {
-                Some(ForcedSide::Subtitle)
-            } else {
-                None
-            }
-        });
-        match forced {
-            Some(side) => self.ingest_paths_as(paths, side),
-            None => self.ingest_paths(paths),
-        }
-    }
-
-    // -----------------------------------------------------------------
     // Side panel
     // -----------------------------------------------------------------
 
@@ -557,6 +518,21 @@ impl App {
         self.render_subtitle_source(ui);
 
         ui.separator();
+
+        ui.horizontal(|ui| {
+            if ui.button("📁 Browse (Auto)…").clicked()
+                && let Some(paths) =
+                    rfd::FileDialog::new().set_title("Select video and subtitle files").pick_files()
+            {
+                self.ingest_paths(paths);
+            }
+            if ui.button("📁 Browse folder…").clicked()
+                && let Some(dir) =
+                    rfd::FileDialog::new().set_title("Select a media folder").pick_folder()
+            {
+                self.ingest_dir_auto(&dir);
+            }
+        });
 
         if ui.button("🗑 Clear all").clicked() {
             self.video_entries.clear();
@@ -568,27 +544,21 @@ impl App {
     }
 
     fn render_video_source(&mut self, ui: &mut egui::Ui) {
-        let pre = ui.min_rect();
         egui::CollapsingHeader::new("📁 Video source").default_open(true).show(ui, |ui| {
             self.render_video_source_body(ui);
         });
-        let post = ui.min_rect();
-        self.sidebar_video_rect = Some(egui::Rect::from_min_max(pre.min, post.max));
     }
 
     fn render_subtitle_source(&mut self, ui: &mut egui::Ui) {
-        let pre = ui.min_rect();
         egui::CollapsingHeader::new("📁 Subtitle source").default_open(true).show(ui, |ui| {
             self.render_subtitle_source_body(ui);
         });
-        let post = ui.min_rect();
-        self.sidebar_subtitle_rect = Some(egui::Rect::from_min_max(pre.min, post.max));
     }
 
     fn render_video_source_body(&mut self, ui: &mut egui::Ui) {
         let n = self.video_entries.len();
         if n == 0 {
-            ui.label("No files yet — drop here or click Browse.");
+            ui.label("No files yet — click Browse.");
         } else {
             let parents = unique_parents(&self.video_entries);
             if parents.len() == 1 {
@@ -602,8 +572,10 @@ impl App {
         }
         ui.horizontal(|ui| {
             if ui.button("📁 Browse…").clicked()
-                && let Some(paths) =
-                    rfd::FileDialog::new().set_title("Select video files").pick_files()
+                && let Some(paths) = rfd::FileDialog::new()
+                    .set_title("Select video files")
+                    .add_filter("Videos", &self.registry.video_exts())
+                    .pick_files()
             {
                 self.ingest_paths_as(paths, ForcedSide::Video);
             }
@@ -617,7 +589,7 @@ impl App {
     fn render_subtitle_source_body(&mut self, ui: &mut egui::Ui) {
         let n = self.subtitle_entries.len();
         if n == 0 {
-            ui.label("No files yet — drop here or click Browse.");
+            ui.label("No files yet — click Browse.");
         } else {
             let parents = unique_parents(&self.subtitle_entries);
             if parents.len() == 1 {
@@ -631,8 +603,10 @@ impl App {
         }
         ui.horizontal(|ui| {
             if ui.button("📁 Browse…").clicked()
-                && let Some(paths) =
-                    rfd::FileDialog::new().set_title("Select subtitle files").pick_files()
+                && let Some(paths) = rfd::FileDialog::new()
+                    .set_title("Select subtitle files")
+                    .add_filter("Subtitles", &self.registry.subtitle_exts())
+                    .pick_files()
             {
                 self.ingest_paths_as(paths, ForcedSide::Subtitle);
             }
@@ -1224,21 +1198,13 @@ impl eframe::App for App {
         // Apply any completed background refresh before rendering.
         self.drain_refresh();
 
-        // Reset sidebar rects each frame; they're repopulated by
-        // `render_sidebar` below.
-        self.sidebar_video_rect = None;
-        self.sidebar_subtitle_rect = None;
-
-        // Left: sidebar with two source CollapsingHeaders (captures rects).
+        // Left: sidebar with two source CollapsingHeaders + Auto entries.
         egui::Panel::left("source").resizable(true).min_size(220.0).max_size(320.0).show(
             ui,
             |ui| {
                 self.render_sidebar(ui);
             },
         );
-
-        // Drop router — sidebar rects are now populated.
-        self.process_drops(ui.ctx());
 
         // Top toolbar.
         egui::Panel::top("toolbar").show(ui, |ui| {
