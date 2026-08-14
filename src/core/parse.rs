@@ -641,15 +641,7 @@ pub fn normalize_key(raw: Option<&str>) -> Option<EpisodeKey> {
     //   S\d+ E(p)? (\d+ ...)
     //   E(p)? (\d+ ...)
     //   bare (\d+ ...)  -- last resort for numeric
-    let patterns: &[&str] = &[
-        r"第\s*(\d+(?:[-.]\d+)*)\s*[话集]",
-        r"s\d+\s*e[p]?\s*(\d+(?:[-.]\d+)*)",
-        r"e[p]?\s*(\d+(?:[-.]\d+)*)",
-        r"(\d+(?:[-.]\d+)*)",
-    ];
-
-    for pat in patterns {
-        let Ok(re) = Regex::new(pat) else { continue };
+    for re in KEY_PATTERNS.iter() {
         if let Some(caps) = re.captures(&lower)
             && let Some(m) = caps.get(1)
         {
@@ -669,7 +661,23 @@ pub fn normalize_key(raw: Option<&str>) -> Option<EpisodeKey> {
     Some(EpisodeKey::Text(text.to_ascii_uppercase()))
 }
 
+/// Episode-marker regexes, compiled once (they are used in a hot loop by
+/// the cross-side alignment scorer).
+static KEY_PATTERNS: std::sync::LazyLock<[Regex; 4]> = std::sync::LazyLock::new(|| {
+    [
+        Regex::new(r"第\s*(\d+(?:[-.]\d+)*)\s*[话集]").unwrap(),
+        Regex::new(r"s\d+\s*e[p]?\s*(\d+(?:[-.]\d+)*)").unwrap(),
+        Regex::new(r"e[p]?\s*(\d+(?:[-.]\d+)*)").unwrap(),
+        Regex::new(r"(\d+(?:[-.]\d+)*)").unwrap(),
+    ]
+});
+
 const SPECIAL_TAGS: &[&str] = &["ncop", "nced", "sp", "op", "ed", "ova", "pv", "cm", "menu"];
+
+/// Numeric canonicalization regex, compiled once (hot path: called per
+/// normalized numeric key by the cross-side alignment scorer).
+static NUMERIC_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"^(?P<num>[\d.\-]+?)(?:v\d+)?$").unwrap());
 
 const CHINESE_NUMERALS: &[&str] = &[
     "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "壹", "贰", "叁", "肆", "伍", "陆",
@@ -681,8 +689,7 @@ const CHINESE_NUMERALS: &[&str] = &[
 fn canonicalize_numeric(raw: &str) -> Option<String> {
     let lower = raw.to_ascii_lowercase();
     // Strip a revision marker like `v2` at the end.
-    let re = Regex::new(r"^(?P<num>[\d.\-]+?)(?:v\d+)?$").unwrap();
-    let caps = re.captures(&lower)?;
+    let caps = NUMERIC_RE.captures(&lower)?;
     let body = caps.name("num")?.as_str();
     if body.is_empty() {
         return None;
