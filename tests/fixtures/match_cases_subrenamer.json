@@ -3,8 +3,6 @@
   "cases": [
     {
       "name": "Basic",
-      "wontfix": true,
-      "wontfix_reason": "diff algorithm limitation: video abc.S02E01.123.mkv tail `.123` and subtitle [SubGroup] def.S02E01.xyz.ass tail `.xyz` diverge so LCP/LCS leaves no shared core. Requires matcher rewrite (out of scope per proposal Non-Goals).",
       "videos": [
         "abc.S02E01.123.mkv",
         "abc.S02E02.abc.mkv",
@@ -22,8 +20,6 @@
     },
     {
       "name": "Breaking Bad (with episode titles)",
-      "wontfix": true,
-      "wontfix_reason": "diff algorithm limitation: video tails contain episode title (Green.Light) while subtitle tails omit it; LCP/LCS cannot align across stems. Requires matcher rewrite (out of scope).",
       "videos": [
         "Breaking.Bad.S03E04.Green.Light.2160p.Netflix.WEB-DL.DDP.5.1.H.265.mkv",
         "Breaking.Bad.S03E12.Half.Measures.2160p.Netflix.WEB-DL.DDP.5.1.H.265.mkv",
@@ -74,8 +70,6 @@
     },
     {
       "name": "BlackDoor (with parentheses)",
-      "wontfix": true,
-      "wontfix_reason": "diff algorithm limitation: video cores `(S01)` and `(S11)` after LCP/LCS become `01`/`11`; subtitle cores `S01E01` and `S01E11` after LCP/LCS become `01`/`11`. (S11) video still aligns to E01 subtitle by mistake. Requires matcher rewrite (out of scope).",
       "videos": [
         "Black Mirror (2011)(1080p)(Webdl)(VP9)(14 lang-AAC- 2.0) (S01) PHDTeam.mkv",
         "Black Mirror (2011)(1080p)(Webdl)(VP9)(14 lang-AAC- 2.0) (S11) PHDTeam.mkv"
@@ -91,8 +85,6 @@
     },
     {
       "name": "Haikyuu!! (with multiple languages, one-to-many)",
-      "wontfix": true,
-      "wontfix_reason": "diff algorithm limitation: video cores after LCP/LCS are `S2 - 09`/`S2 - 10`, subtitle cores are `09`/`10`. The `S2 - ` prefix on the video side prevents direct alignment; cross-side alignment fails. Requires matcher rewrite (out of scope).",
       "videos": [
         "[Kamigami] Haikyuu!! S2 - 09 [1920x1080 HEVC AAC Sub(Chs,Cht,Jap)].mkv",
         "[Kamigami] Haikyuu!! S2 - 10 [1920x1080 HEVC AAC Sub(Chs,Cht,Jap)].mkv"

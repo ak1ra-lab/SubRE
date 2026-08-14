@@ -3,12 +3,15 @@
 //! `ExtensionRegistry` decides whether a path is a video, subtitle, or unknown.
 //! `extract_keys` finds the episode key for each filename in a group using
 //! longest-common-prefix/suffix stripping with a ranking over candidate
-//! variable fields. `normalize_key` canonicalizes a raw key into an
-//! `EpisodeKey` so that variants like `01` / `E1` / `EP01` / `01v2` all
-//! compare equal and `01-02` / `01.5` survive as compound keys.
+//! variable fields. `extract_keys_cross` does the same by aligning the
+//! variable slot across the video side and the subtitle side so that
+//! stems with mismatched noise / episode-title tails still pair up.
+//! `normalize_key` canonicalizes a raw key into an `EpisodeKey` so that
+//! variants like `01` / `E1` / `EP01` / `01v2` all compare equal and
+//! `01-02` / `01.5` survive as compound keys.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use regex::Regex;
@@ -257,10 +260,13 @@ pub fn extract_keys(stems: &[&str]) -> Vec<RawKey> {
                 fields
                     .get(idx)
                     .filter(|f| {
-                        matches!(f.kind, FieldKind::Digit | FieldKind::Alpha)
-                            // CJK-only "separator" run (e.g. `一` after
-                            // LCP/LCS strips `中文 第…集`) is still a valid
-                            // variable-region key.
+                        matches!(
+                            f.kind,
+                            FieldKind::Digit | FieldKind::Alpha | FieldKind::CjkAlpha
+                        )
+                            // Defensive: CJK-only "separator" run (e.g. `一`
+                            // after LCP/LCS strips `中文 第…集`) is still a
+                            // valid variable-region key.
                             || is_cjk_text_field(f)
                     })
                     .map_or(RawKey(None), |f| RawKey(Some(f.text.to_string())))
@@ -276,11 +282,17 @@ pub fn extract_keys(stems: &[&str]) -> Vec<RawKey> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum FieldKind {
     Digit,
     Alpha,
     Separator,
+    /// Non-ASCII alphabetic token (e.g. `中文`, `機動`, `一`).
+    CjkAlpha,
+    /// Reserved for future CJK digit characters; not produced by `split_fields`
+    /// today since CJK numerals are alphabetic in Unicode.
+    #[allow(dead_code)] // placeholder for future CJK decimal / numeric support
+    CjkDigit,
 }
 
 #[derive(Debug, Clone)]
@@ -289,11 +301,22 @@ struct Field<'a> {
     kind: FieldKind,
 }
 
+// Compiled once. The pattern handles four disjoint alternatives:
+//   - ASCII digit runs (numeric tokens; compound forms like `01-02` / `01.5`
+//     are intentionally NOT combined with the digit run — they're rare in
+//     practice and combining them causes spurious cross-side matches e.g.
+//     `S02E01.123` would otherwise parse as `01.123` and defeat the variable
+//     slot alignment)
+//   - pure ASCII alpha runs
+//   - any Unicode alphabetic run (catches pure CJK like `中文` / `機動`)
+//   - any run of non-alphanumeric characters (separators)
+static SPLIT_FIELDS_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"\d+|[A-Za-z]+|\p{Alphabetic}+|[^\p{Alphabetic}\p{Digit}]+").unwrap()
+});
+
 fn split_fields(s: &str) -> Vec<Field<'_>> {
-    // Number token regex: digits, optionally joined by '-' or '.' between
-    // digits (preserves "01-02", "01.5" as a single field).
-    let re = Regex::new(r"\d+(?:[-.]\d+)*|[A-Za-z]+|[^A-Za-z0-9]+").unwrap();
-    re.find_iter(s)
+    SPLIT_FIELDS_RE
+        .find_iter(s)
         .map(|m| {
             let text = m.as_str();
             let kind = if text.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '.') {
@@ -304,8 +327,12 @@ fn split_fields(s: &str) -> Vec<Field<'_>> {
                 } else {
                     FieldKind::Separator
                 }
-            } else if text.chars().all(|c| c.is_ascii_alphabetic()) {
-                FieldKind::Alpha
+            } else if text.chars().all(char::is_alphabetic) {
+                if text.chars().any(|c| !c.is_ascii() && c.is_alphabetic()) {
+                    FieldKind::CjkAlpha
+                } else {
+                    FieldKind::Alpha
+                }
             } else {
                 FieldKind::Separator
             };
@@ -378,7 +405,7 @@ fn rank_variable_field(cores: &[Vec<Field<'_>>]) -> Option<usize> {
         let values: Vec<&Field<'_>> = cores
             .iter()
             .filter_map(|f| f.get(idx))
-            .filter(|f| matches!(f.kind, FieldKind::Digit | FieldKind::Alpha))
+            .filter(|f| matches!(f.kind, FieldKind::Digit | FieldKind::Alpha | FieldKind::CjkAlpha))
             .collect();
         if values.len() < n_cores {
             // Some stems don't have this field — ignore for ranking.
@@ -729,6 +756,298 @@ pub fn extract_with_regex(stems: &[&str], pattern: &str) -> Vec<RawKey> {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-side token alignment (matcher-rewrite)
+// ---------------------------------------------------------------------------
+
+/// Count how many stems each `(text, kind)` token appears in, and at which
+/// `(stem_idx, token_idx)` positions within each stem.
+///
+/// This is the first step of the cross-side alignment algorithm: build a
+/// per-side map of token → positions so we can later identify "anchor"
+/// tokens (constant across stems) and "episodic" tokens (one value per
+/// stem) without depending on LCP/LCS stripping.
+fn count_token_occurrences(
+    token_seqs: &[Vec<Field<'_>>],
+) -> HashMap<(String, FieldKind), Vec<(usize, usize)>> {
+    let mut counts: HashMap<(String, FieldKind), Vec<(usize, usize)>> = HashMap::new();
+    for (stem_idx, tokens) in token_seqs.iter().enumerate() {
+        for (token_idx, field) in tokens.iter().enumerate() {
+            counts
+                .entry((field.text.to_string(), field.kind))
+                .or_default()
+                .push((stem_idx, token_idx));
+        }
+    }
+    counts
+}
+
+/// Per-slot diversity: for each slot index, the set of `(text, kind)` values
+/// observed across stems. Used to determine which slots are "variable"
+/// (diversity ≥ 2) on each side independently.
+fn slot_value_sets(token_seqs: &[Vec<Field<'_>>]) -> Vec<HashSet<(String, FieldKind)>> {
+    let max_len = token_seqs.iter().map(std::vec::Vec::len).max().unwrap_or(0);
+    let mut sets = vec![HashSet::new(); max_len];
+    for tokens in token_seqs {
+        for (slot_idx, field) in tokens.iter().enumerate() {
+            sets[slot_idx].insert((field.text.to_string(), field.kind));
+        }
+    }
+    sets
+}
+
+/// A cross-side candidate: a `(text, kind)` token that appears on both sides
+/// and whose slot is variable on both sides (so cross-side alignment is
+/// meaningful). The `video_diversity` / `sub_diversity` fields are the
+/// maximum per-slot diversity observed at any position where the token
+/// appears (the "field value count" referred to in the design).
+struct CrossSideCandidate {
+    token_text: String,
+    token_kind: FieldKind,
+    video_diversity: usize,
+    sub_diversity: usize,
+    video_token_indices: Vec<(usize, usize)>,
+    sub_token_indices: Vec<(usize, usize)>,
+}
+
+/// Build the ranked candidate list from per-side counts and per-slot
+/// diversity.
+///
+/// Filtering rule: the token appears on both sides AND its max slot
+/// diversity is ≥ 2 on both sides (the slot is variable on both sides).
+/// Ranking: `Digit > CjkDigit > CjkAlpha > Alpha > Separator`, tie-broken
+/// by `video_diversity + sub_diversity` (higher wins), then by total
+/// occurrence count across both sides (lower = more "episodic" = wins),
+/// then by `token_text.len()` ascending (shorter avoids release-group
+/// hits), then lexicographic ascending.
+fn cross_side_candidates(
+    video_counts: &HashMap<(String, FieldKind), Vec<(usize, usize)>>,
+    sub_counts: &HashMap<(String, FieldKind), Vec<(usize, usize)>>,
+    video_slot_sets: &[HashSet<(String, FieldKind)>],
+    sub_slot_sets: &[HashSet<(String, FieldKind)>],
+) -> Vec<CrossSideCandidate> {
+    let mut candidates: Vec<CrossSideCandidate> = Vec::new();
+    for (key, video_indices) in video_counts {
+        let Some(sub_indices) = sub_counts.get(key) else {
+            continue;
+        };
+        let max_video_div = video_indices
+            .iter()
+            .map(|&(_, slot)| video_slot_sets.get(slot).map_or(0, HashSet::len))
+            .max()
+            .unwrap_or(0);
+        let max_sub_div = sub_indices
+            .iter()
+            .map(|&(_, slot)| sub_slot_sets.get(slot).map_or(0, HashSet::len))
+            .max()
+            .unwrap_or(0);
+        if max_video_div < 2 || max_sub_div < 2 {
+            continue;
+        }
+        candidates.push(CrossSideCandidate {
+            token_text: key.0.clone(),
+            token_kind: key.1,
+            video_diversity: max_video_div,
+            sub_diversity: max_sub_div,
+            video_token_indices: video_indices.clone(),
+            sub_token_indices: sub_indices.clone(),
+        });
+    }
+    candidates.sort_by(|a, b| {
+        kind_priority(b.token_kind)
+            .cmp(&kind_priority(a.token_kind))
+            .then_with(|| {
+                (b.video_diversity + b.sub_diversity).cmp(&(a.video_diversity + a.sub_diversity))
+            })
+            .then_with(|| {
+                (a.video_token_indices.len() + a.sub_token_indices.len())
+                    .cmp(&(b.video_token_indices.len() + b.sub_token_indices.len()))
+            })
+            .then_with(|| a.token_text.len().cmp(&b.token_text.len()))
+            .then_with(|| a.token_text.cmp(&b.token_text))
+    });
+    candidates
+}
+
+/// Ordering priority for cross-side candidate selection. Mirrors the
+/// existing `SegmentType::score` for ASCII tokens and extends it to CJK.
+fn kind_priority(kind: FieldKind) -> u32 {
+    match kind {
+        FieldKind::Digit => 5,
+        FieldKind::CjkDigit => 4,
+        FieldKind::CjkAlpha => 3,
+        FieldKind::Alpha => 2,
+        FieldKind::Separator => 1,
+    }
+}
+
+/// For a candidate token, pick the single slot index on each side where it
+/// "represents the variable part". If the token appears at one slot per
+/// side, that slot is unambiguous. Otherwise we prefer the slot whose
+/// diversity equals the candidate's recorded diversity (i.e. the slot
+/// that is itself variable) and break ties by lower slot index (closer to
+/// the stem head).
+fn pick_slot_for_candidate(
+    indices: &[(usize, usize)],
+    slot_sets: &[HashSet<(String, FieldKind)>],
+) -> Option<usize> {
+    if indices.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, usize)> = None;
+    for &(_, slot) in indices {
+        let div = slot_sets.get(slot).map_or(0, HashSet::len);
+        let prefer = match best {
+            None => true,
+            Some((best_div, best_slot)) => div > best_div || (div == best_div && slot < best_slot),
+        };
+        if prefer {
+            best = Some((div, slot));
+        }
+    }
+    best.map(|(_, slot)| slot)
+}
+
+/// Compute how many cross-side `(video_stem, sub_stem)` pairs have
+/// matching [`EpisodeKey`]s at the given slots. Returns
+/// `(matches, total_pairs)`. Matching is done after normalization so
+/// `1` <-> `01`, `E1` <-> `EP1`, `01` <-> `一`, etc. all compare equal.
+fn alignment_score(
+    video_tokens: &[Vec<Field<'_>>],
+    sub_tokens: &[Vec<Field<'_>>],
+    video_slot: usize,
+    sub_slot: usize,
+) -> (usize, usize) {
+    let mut matches = 0usize;
+    let mut total = 0usize;
+    for v_stem in video_tokens {
+        for s_stem in sub_tokens {
+            let Some(v_field) = v_stem.get(video_slot) else { continue };
+            let Some(s_field) = s_stem.get(sub_slot) else { continue };
+            total += 1;
+            let v_norm = normalize_key(Some(v_field.text));
+            let s_norm = normalize_key(Some(s_field.text));
+            if v_norm.is_some() && v_norm == s_norm {
+                matches += 1;
+            }
+        }
+    }
+    (matches, total)
+}
+
+/// Pick the best cross-side slot pair from the candidate list.
+///
+/// For each candidate, derive the `(video_slot, sub_slot)` pair where
+/// the candidate's slot is most variable (via
+/// [`pick_slot_for_candidate`]). Score each pair by:
+///
+/// 1. Combined per-slot diversity of the *picked* slot on each side
+///    (higher wins -- a real episode slot has many distinct values).
+/// 2. Cross-side alignment: matches then total pairs (higher = more
+///    confidence).
+/// 3. Candidate position count (lower = more "episodic").
+///
+/// Diversity is scored first so that noisy short-noise matches (e.g.
+/// a coincidental `1` ↔ `1` in release-group suffixes) don't override
+/// the actual episode slot.
+fn pick_best_slot_pair(
+    candidates: &[CrossSideCandidate],
+    video_tokens: &[Vec<Field<'_>>],
+    sub_tokens: &[Vec<Field<'_>>],
+    video_slot_sets: &[HashSet<(String, FieldKind)>],
+    sub_slot_sets: &[HashSet<(String, FieldKind)>],
+) -> Option<(usize, usize)> {
+    type SlotPairScore = (usize, usize, usize, usize);
+    let mut best: Option<(usize, usize, SlotPairScore)> = None;
+    for cand in candidates {
+        let Some(v_slot) = pick_slot_for_candidate(&cand.video_token_indices, video_slot_sets)
+        else {
+            continue;
+        };
+        let Some(s_slot) = pick_slot_for_candidate(&cand.sub_token_indices, sub_slot_sets) else {
+            continue;
+        };
+        let alignment = alignment_score(video_tokens, sub_tokens, v_slot, s_slot);
+        let v_div = video_slot_sets.get(v_slot).map_or(0, HashSet::len);
+        let s_div = sub_slot_sets.get(s_slot).map_or(0, HashSet::len);
+        let cand_occ = cand.video_token_indices.len() + cand.sub_token_indices.len();
+        // Score key: (combined slot diversity, matches, total pairs,
+        // -occurrences). Diversity is ranked first so noisy short-noise
+        // matches (e.g. coincidental `1` <-> `1` in release-group
+        // suffixes) don't override the actual episode slot.
+        let key = (v_div + s_div, alignment.0, alignment.1, usize::MAX - cand_occ);
+        if best.is_none_or(|b| key > b.2) {
+            best = Some((v_slot, s_slot, key));
+        }
+    }
+    let (v_slot, s_slot, _) = best?;
+    Some((v_slot, s_slot))
+}
+
+/// Extract raw episode keys for the video and subtitle sides jointly.
+///
+/// The function:
+///   1. NFKD + whitespace-folds each stem (via [`normalize_stem`]).
+///   2. Tokenizes each stem into Digit / Alpha / Separator / `CjkAlpha`
+///      fields (via [`split_fields`]).
+///   3. Counts `(text, kind)` occurrences and per-slot diversity on each
+///      side independently.
+///   4. Builds a ranked candidate list and picks the top-1 token whose
+///      slot is variable on both sides.
+///   5. Extracts the field at that token's slot from each stem; stems
+///      without the slot become `RawKey(None)`.
+///   6. Falls back to per-side [`extract_keys`] (the LCP/LCS + heuristic
+///      path) when there are zero candidates — i.e. the stems share no
+///      variable token across sides.
+///
+/// The returned pair of `Vec<RawKey>` has one entry per input stem on the
+/// corresponding side. Empty input sides produce empty output.
+pub fn extract_keys_cross(videos: &[&str], subtitles: &[&str]) -> (Vec<RawKey>, Vec<RawKey>) {
+    if videos.is_empty() && subtitles.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    // Normalize + tokenize each side.
+    let video_norms: Vec<String> = videos.iter().map(|s| normalize_stem(s).into_owned()).collect();
+    let sub_norms: Vec<String> = subtitles.iter().map(|s| normalize_stem(s).into_owned()).collect();
+    let video_tokens: Vec<Vec<Field<'_>>> = video_norms.iter().map(|s| split_fields(s)).collect();
+    let sub_tokens: Vec<Vec<Field<'_>>> = sub_norms.iter().map(|s| split_fields(s)).collect();
+
+    // Per-side statistics.
+    let video_counts = count_token_occurrences(&video_tokens);
+    let sub_counts = count_token_occurrences(&sub_tokens);
+    let video_slot_sets = slot_value_sets(&video_tokens);
+    let sub_slot_sets = slot_value_sets(&sub_tokens);
+
+    let candidates =
+        cross_side_candidates(&video_counts, &sub_counts, &video_slot_sets, &sub_slot_sets);
+    let Some((video_slot, sub_slot)) = pick_best_slot_pair(
+        &candidates,
+        &video_tokens,
+        &sub_tokens,
+        &video_slot_sets,
+        &sub_slot_sets,
+    ) else {
+        // No shared variable token -- fall back to the LCP/LCS + heuristic
+        // path on each side independently.
+        let v_refs: Vec<&str> = video_norms.iter().map(String::as_str).collect();
+        let s_refs: Vec<&str> = sub_norms.iter().map(String::as_str).collect();
+        return (extract_keys(&v_refs), extract_keys(&s_refs));
+    };
+
+    let extract_at = |tokens: &[Vec<Field<'_>>], slot: usize| -> Vec<RawKey> {
+        tokens
+            .iter()
+            .map(|fields| match fields.get(slot) {
+                Some(f) => RawKey(Some(f.text.to_string())),
+                None => RawKey(None),
+            })
+            .collect()
+    };
+
+    (extract_at(&video_tokens, video_slot), extract_at(&sub_tokens, sub_slot))
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -982,5 +1301,368 @@ mod tests {
             raws.iter().map(|r| normalize_key(r.0.as_deref())).collect();
         assert_eq!(keys[0], Some(EpisodeKey::Number("1".into())));
         assert_eq!(keys[1], Some(EpisodeKey::Number("77".into())));
+    }
+
+    // --- Task 1.3: FieldKind classification for CJK + ASCII digit groups.
+
+    #[test]
+    fn split_fields_classifies_pure_cjk_as_cjk_alpha() {
+        let fields = split_fields("中文");
+        assert_eq!(fields.len(), 1);
+        assert!(matches!(fields[0].kind, FieldKind::CjkAlpha));
+        assert_eq!(fields[0].text, "中文");
+    }
+
+    #[test]
+    fn split_fields_classifies_kanji_run_as_cjk_alpha() {
+        let fields = split_fields("機動");
+        assert_eq!(fields.len(), 1);
+        assert!(matches!(fields[0].kind, FieldKind::CjkAlpha));
+        assert_eq!(fields[0].text, "機動");
+    }
+
+    #[test]
+    fn split_fields_splits_cjk_with_separator() {
+        // Pure CJK runs are kept as a single CjkAlpha field; ASCII
+        // whitespace between them falls through as a Separator.
+        let fields = split_fields("中文 第一集");
+        assert_eq!(fields.len(), 3);
+        assert!(matches!(fields[0].kind, FieldKind::CjkAlpha));
+        assert_eq!(fields[0].text, "中文");
+        assert!(matches!(fields[1].kind, FieldKind::Separator));
+        assert!(matches!(fields[2].kind, FieldKind::CjkAlpha));
+        assert_eq!(fields[2].text, "第一集");
+    }
+
+    // --- Task 2.4: cross-side perspective: episode digit slot is variable
+    //                on both sides even when its specific values differ.
+
+    #[test]
+    fn cross_side_basic_picks_episode_digit_slot() {
+        // From the Basic corpus case: each side's digit slot has 3 distinct
+        // values across stems. The token `01` only appears in 1 stem per
+        // side, but its slot is variable on both sides — so the cross-side
+        // algorithm picks the slot pair (5, 9) and extracts the value at
+        // that slot from every stem, yielding the correct episode digits.
+        let videos = ["abc.S02E01.123", "abc.S02E02.abc", "abc.S02E03.ccc"];
+        let subs =
+            ["[SubGroup] def.S02E01.xyz", "[SubGroup] def.S02E02.abc", "[SubGroup] def.S02E04.kkk"];
+        let v_ref: Vec<&str> = videos.to_vec();
+        let s_ref: Vec<&str> = subs.to_vec();
+        let (v_raw, s_raw) = extract_keys_cross(&v_ref, &s_ref);
+        let v_keys: Vec<Option<EpisodeKey>> =
+            v_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        let s_keys: Vec<Option<EpisodeKey>> =
+            s_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        assert_eq!(
+            v_keys,
+            vec![
+                Some(EpisodeKey::Number("1".into())),
+                Some(EpisodeKey::Number("2".into())),
+                Some(EpisodeKey::Number("3".into())),
+            ]
+        );
+        assert_eq!(
+            s_keys,
+            vec![
+                Some(EpisodeKey::Number("1".into())),
+                Some(EpisodeKey::Number("2".into())),
+                Some(EpisodeKey::Number("4".into())),
+            ]
+        );
+    }
+
+    // --- Task 3.3: 4 wontfix cases now all pass via cross-side.
+
+    #[test]
+    fn cross_side_breaking_bad_picks_episode_digit() {
+        let videos = [
+            "Breaking.Bad.S03E04.Green.Light.2160p.Netflix.WEB-DL.DDP.5.1.H.265",
+            "Breaking.Bad.S03E12.Half.Measures.2160p.Netflix.WEB-DL.DDP.5.1.H.265",
+            "Breaking.Bad.S03E100.Test.Test.2160p.Netflix.WEB-DL.DDP.5.1.H.265",
+        ];
+        let subs = [
+            "breaking.bad.s03e12.720p.hdtv.x264-ctu.en",
+            "Breaking.Bad.S03E04.720p.HDTV.x264-CTU.en",
+            "Breaking.Bad.S03E123.720p.HDTV.x264-CTU.en",
+        ];
+        let v_ref: Vec<&str> = videos.to_vec();
+        let s_ref: Vec<&str> = subs.to_vec();
+        let (v_raw, s_raw) = extract_keys_cross(&v_ref, &s_ref);
+        let v_keys: Vec<Option<EpisodeKey>> =
+            v_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        let s_keys: Vec<Option<EpisodeKey>> =
+            s_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        assert_eq!(
+            v_keys,
+            vec![
+                Some(EpisodeKey::Number("4".into())),
+                Some(EpisodeKey::Number("12".into())),
+                Some(EpisodeKey::Number("100".into())),
+            ]
+        );
+        assert_eq!(
+            s_keys,
+            vec![
+                Some(EpisodeKey::Number("12".into())),
+                Some(EpisodeKey::Number("4".into())),
+                Some(EpisodeKey::Number("123".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_side_blackdoor_picks_episode_digit() {
+        let videos = [
+            "Black Mirror (2011)(1080p)(Webdl)(VP9)(14 lang-AAC- 2.0) (S01) PHDTeam",
+            "Black Mirror (2011)(1080p)(Webdl)(VP9)(14 lang-AAC- 2.0) (S11) PHDTeam",
+        ];
+        let subs =
+            ["Black Mirror_S01E01_Patnáct milionů meritů", "Black Mirror_S01E11_P15milMeritů-EN"];
+        let v_ref: Vec<&str> = videos.to_vec();
+        let s_ref: Vec<&str> = subs.to_vec();
+        let (v_raw, s_raw) = extract_keys_cross(&v_ref, &s_ref);
+        let v_keys: Vec<Option<EpisodeKey>> =
+            v_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        let s_keys: Vec<Option<EpisodeKey>> =
+            s_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        assert_eq!(
+            v_keys,
+            vec![Some(EpisodeKey::Number("1".into())), Some(EpisodeKey::Number("11".into())),]
+        );
+        assert_eq!(
+            s_keys,
+            vec![Some(EpisodeKey::Number("1".into())), Some(EpisodeKey::Number("11".into())),]
+        );
+    }
+
+    #[test]
+    fn cross_side_haikyuu_picks_episode_digit() {
+        let videos = [
+            "[Kamigami] Haikyuu!! S2 - 09 [1920x1080 HEVC AAC Sub(Chs,Cht,Jap)]",
+            "[Kamigami] Haikyuu!! S2 - 10 [1920x1080 HEVC AAC Sub(Chs,Cht,Jap)]",
+        ];
+        let subs = [
+            "[YYDM-11FANS][Haikyuu!!][09][BDRIP][720P][X264-10bit_AAC][40A7E056].en",
+            "[YYDM-11FANS][Haikyuu!!][09][BDRIP][720P][X264-10bit_AAC][40A7E056].sc",
+            "[YYDM-11FANS][Haikyuu!!][09][BDRIP][720P][X264-10bit_AAC][40A7E056].tc",
+            "[YYDM-11FANS][Haikyuu!!][10][BDRIP][720P][X264-10bit_AAC][6FDEFD72].sc",
+            "[YYDM-11FANS][Haikyuu!!][10][BDRIP][720P][X264-10bit_AAC][6FDEFD72].tc",
+        ];
+        let v_ref: Vec<&str> = videos.to_vec();
+        let s_ref: Vec<&str> = subs.to_vec();
+        let (v_raw, s_raw) = extract_keys_cross(&v_ref, &s_ref);
+        let v_keys: Vec<Option<EpisodeKey>> =
+            v_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        let s_keys: Vec<Option<EpisodeKey>> =
+            s_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        assert_eq!(
+            v_keys,
+            vec![Some(EpisodeKey::Number("9".into())), Some(EpisodeKey::Number("10".into())),]
+        );
+        assert_eq!(
+            s_keys,
+            vec![
+                Some(EpisodeKey::Number("9".into())),
+                Some(EpisodeKey::Number("9".into())),
+                Some(EpisodeKey::Number("9".into())),
+                Some(EpisodeKey::Number("10".into())),
+                Some(EpisodeKey::Number("10".into())),
+            ]
+        );
+    }
+
+    // --- Task 6.1: fallback when no shared variable token.
+
+    #[test]
+    fn cross_side_falls_back_when_no_shared_token() {
+        // Video and subtitle share no common token; each side has its
+        // own variable slot that the other side knows nothing about.
+        // The cross-side algorithm falls back to per-side extract_keys
+        // (LCP/LCS + heuristic) so each side still gets a usable key.
+        let videos = ["AAA_one", "AAA_two", "AAA_three"];
+        let subs = ["BBB_aaa", "BBB_bbb", "BBB_ccc"];
+        let v_ref: Vec<&str> = videos.to_vec();
+        let s_ref: Vec<&str> = subs.to_vec();
+        let (v_raw, s_raw) = extract_keys_cross(&v_ref, &s_ref);
+        let v_keys: Vec<Option<EpisodeKey>> =
+            v_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        let s_keys: Vec<Option<EpisodeKey>> =
+            s_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        // Per-side fallback: video side gets the variable trailing alpha
+        // (one/two/three -> ONE/TWO/THREE text keys); subtitle side
+        // gets the variable trailing alpha (aaa/bbb/ccc -> AAA/BBB/CCC).
+        assert_eq!(
+            v_keys,
+            vec![
+                Some(EpisodeKey::Text("ONE".into())),
+                Some(EpisodeKey::Text("TWO".into())),
+                Some(EpisodeKey::Text("THREE".into())),
+            ]
+        );
+        assert_eq!(
+            s_keys,
+            vec![
+                Some(EpisodeKey::Text("AAA".into())),
+                Some(EpisodeKey::Text("BBB".into())),
+                Some(EpisodeKey::Text("CCC".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_side_falls_back_to_per_side_when_only_anchor_is_shared() {
+        // Both sides share a constant token (`01`) but the *variable*
+        // parts differ (`x` / `y` on video, `a` / `b` on sub) and don't
+        // appear on the other side. With no shared variable token the
+        // cross-side algorithm falls back to per-side extract_keys,
+        // which picks each side's own variable Alpha field.
+        let videos = ["prefix_01_x", "prefix_01_y"];
+        let subs = ["other_01_a", "other_01_b"];
+        let v_ref: Vec<&str> = videos.to_vec();
+        let s_ref: Vec<&str> = subs.to_vec();
+        let (v_raw, s_raw) = extract_keys_cross(&v_ref, &s_ref);
+        let v_keys: Vec<Option<EpisodeKey>> =
+            v_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        let s_keys: Vec<Option<EpisodeKey>> =
+            s_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        assert_eq!(
+            v_keys,
+            vec![Some(EpisodeKey::Text("X".into())), Some(EpisodeKey::Text("Y".into())),]
+        );
+        assert_eq!(
+            s_keys,
+            vec![Some(EpisodeKey::Text("A".into())), Some(EpisodeKey::Text("B".into())),]
+        );
+    }
+
+    // --- Task 6.2: SPECIAL_TAGS + CHINESE_NUMERALS in cross-side path.
+
+    #[test]
+    fn cross_side_special_tag_in_mixed_variable_slot_yields_text_key() {
+        // Mixed set where the variable slot contains one SPECIAL_TAG
+        // and two numeric values; the cross-side algorithm picks the
+        // slot, and `normalize_key` classifies `SP` as a text key
+        // while the digit values become numeric keys.
+        let videos = ["Death_Note - SP 01", "Death_Note - 02", "Death_Note - 03"];
+        let subs = ["Death_Note - SP 01", "Death_Note - 02", "Death_Note - 03"];
+        let v_ref: Vec<&str> = videos.to_vec();
+        let s_ref: Vec<&str> = subs.to_vec();
+        let (v_raw, s_raw) = extract_keys_cross(&v_ref, &s_ref);
+        let v_keys: Vec<Option<EpisodeKey>> =
+            v_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        let s_keys: Vec<Option<EpisodeKey>> =
+            s_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        assert_eq!(
+            v_keys,
+            vec![
+                Some(EpisodeKey::Text("SP".into())),
+                Some(EpisodeKey::Number("2".into())),
+                Some(EpisodeKey::Number("3".into())),
+            ]
+        );
+        assert_eq!(
+            s_keys,
+            vec![
+                Some(EpisodeKey::Text("SP".into())),
+                Some(EpisodeKey::Number("2".into())),
+                Some(EpisodeKey::Number("3".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_side_chinese_numeral_pair_yields_text_key() {
+        // The cross-side algorithm extracts the whole CJK run
+        // (`第一集` / `第二集`) since the new regex keeps CJK alpha
+        // runs intact. `normalize_key` then classifies them as text
+        // keys via the catch-all text path (the byte-level
+        // `starts_with` doesn't recognize `第` as a numeral, so the
+        // full run text is preserved as the text key). Both sides
+        // produce matching texts, so pairing succeeds.
+        let videos = ["中文 第一集", "中文 第二集"];
+        let subs = ["【字幕】中文 第一集", "【字幕】中文 第二集"];
+        let v_ref: Vec<&str> = videos.to_vec();
+        let s_ref: Vec<&str> = subs.to_vec();
+        let (v_raw, s_raw) = extract_keys_cross(&v_ref, &s_ref);
+        let v_keys: Vec<Option<EpisodeKey>> =
+            v_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        let s_keys: Vec<Option<EpisodeKey>> =
+            s_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        assert_eq!(
+            v_keys,
+            vec![Some(EpisodeKey::Text("第一集".into())), Some(EpisodeKey::Text("第二集".into())),]
+        );
+        assert_eq!(
+            s_keys,
+            vec![Some(EpisodeKey::Text("第一集".into())), Some(EpisodeKey::Text("第二集".into())),]
+        );
+    }
+
+    // --- Task 6.3: NFKD + whitespace folding still effective cross-side.
+
+    #[test]
+    fn cross_side_nfkd_pairs_simplified_traditional() {
+        // Video uses simplified, subtitle has both simplified and
+        // traditional (機動 vs 机动). NFKD normalizes both, and the
+        // cross-side algorithm pairs the episode digit even though
+        // the show title contains mixed scripts.
+        let videos = [
+            "[AI-Raws] 机动警察パトレイバー #1",
+            "[AI-Raws] 机动警察パトレイバー #2",
+            "[AI-Raws] 机动警察パトレイバー #10",
+        ];
+        let subs = [
+            "[字幕] 机动警察 機動警察パトレイバー 01",
+            "[字幕] 机动警察 機動警察パトレイバー 02",
+            "[字幕] 机动警察 機動警察パトレイバー 10",
+        ];
+        let v_ref: Vec<&str> = videos.to_vec();
+        let s_ref: Vec<&str> = subs.to_vec();
+        let (v_raw, s_raw) = extract_keys_cross(&v_ref, &s_ref);
+        let v_keys: Vec<Option<EpisodeKey>> =
+            v_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        let s_keys: Vec<Option<EpisodeKey>> =
+            s_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        assert_eq!(
+            v_keys,
+            vec![
+                Some(EpisodeKey::Number("1".into())),
+                Some(EpisodeKey::Number("2".into())),
+                Some(EpisodeKey::Number("10".into())),
+            ]
+        );
+        assert_eq!(
+            s_keys,
+            vec![
+                Some(EpisodeKey::Number("1".into())),
+                Some(EpisodeKey::Number("2".into())),
+                Some(EpisodeKey::Number("10".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_side_whitespace_fold_pairs() {
+        // "视频 1 xyz" vs "字幕 1xyz" — after whitespace fold on each
+        // side the cores share the same digit, and the cross-side
+        // algorithm still pairs the two stems.
+        let videos = ["视频 1 xyz", "视频 77 test xyz"];
+        let subs = ["字幕 1xyz", "字幕 77test xyz"];
+        let v_ref: Vec<&str> = videos.to_vec();
+        let s_ref: Vec<&str> = subs.to_vec();
+        let (v_raw, s_raw) = extract_keys_cross(&v_ref, &s_ref);
+        let v_keys: Vec<Option<EpisodeKey>> =
+            v_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        let s_keys: Vec<Option<EpisodeKey>> =
+            s_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect();
+        assert_eq!(
+            v_keys,
+            vec![Some(EpisodeKey::Number("1".into())), Some(EpisodeKey::Number("77".into())),]
+        );
+        assert_eq!(
+            s_keys,
+            vec![Some(EpisodeKey::Number("1".into())), Some(EpisodeKey::Number("77".into())),]
+        );
     }
 }

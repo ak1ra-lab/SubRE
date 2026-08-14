@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::parse::{EpisodeKey, RawKey, extract_keys, normalize_key};
+use super::parse::{EpisodeKey, RawKey, extract_keys, extract_keys_cross, normalize_key};
 
 /// A single file dropped into the app.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,15 +104,36 @@ impl Matcher {
             !videos.is_empty() && !subtitles.is_empty() && videos.len() > 1 && subtitles.len() == 1;
         let force_heuristic_videos = one_to_many_videos || one_to_many_subtitles;
         let force_heuristic_subtitles = one_to_many_subtitles || one_to_many_videos;
-        let video_keys = if force_heuristic_videos {
-            heuristic_keys(videos)
+        // Cross-side token alignment kicks in when both sides have more than
+        // one stem and neither side is using a user-supplied regex override.
+        // Regex overrides and 1vN scenarios keep the legacy per-side path so
+        // existing behavior is preserved.
+        let use_cross_side = !force_heuristic_videos
+            && !force_heuristic_subtitles
+            && videos.len() > 1
+            && subtitles.len() > 1
+            && video_regex.is_none()
+            && subtitle_regex.is_none();
+        let (video_keys, subtitle_keys) = if use_cross_side {
+            let video_stems: Vec<&str> = videos.iter().map(|f| f.stem.as_str()).collect();
+            let subtitle_stems: Vec<&str> = subtitles.iter().map(|f| f.stem.as_str()).collect();
+            let (v_raw, s_raw) = extract_keys_cross(&video_stems, &subtitle_stems);
+            (
+                v_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect(),
+                s_raw.iter().map(|r| normalize_key(r.0.as_deref())).collect(),
+            )
         } else {
-            compute_keys(videos, video_regex)
-        };
-        let subtitle_keys = if force_heuristic_subtitles {
-            heuristic_keys(subtitles)
-        } else {
-            compute_keys(subtitles, subtitle_regex)
+            let v = if force_heuristic_videos {
+                heuristic_keys(videos)
+            } else {
+                compute_keys(videos, video_regex)
+            };
+            let s = if force_heuristic_subtitles {
+                heuristic_keys(subtitles)
+            } else {
+                compute_keys(subtitles, subtitle_regex)
+            };
+            (v, s)
         };
 
         let mut by_key: BTreeMap<EpisodeKey, PairGroup> = BTreeMap::new();
