@@ -1,4 +1,4 @@
-//! Filesystem execution: rename / copy per the plan, plus undo.
+//! Filesystem execution: rename / copy per the plan, plus session-level rollback.
 //!
 //! This module is the ONLY place that touches the filesystem for renames
 //! or copies. Errors are collected per-op and returned in [`ExecuteReport`]
@@ -75,35 +75,6 @@ fn do_copy(op: &PlannedOp) -> Result<(), ExecuteError> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Undo
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UndoRecord {
-    pub action: PlannedAction,
-    pub src_path: PathBuf,
-    pub dst_path: PathBuf,
-    pub src_mtime: i64,
-    pub src_size: i64,
-}
-
-/// Snapshot of `path`'s mtime + size + content checksum, taken before
-/// the rename/copy. The checksum is a SHA-256 hex digest of the file's
-/// bytes at snapshot time and is used during undo to verify that the
-/// destination file has not been altered since the rename/copy.
-pub fn snapshot(path: &Path) -> std::io::Result<(i64, i64, String)> {
-    let meta = fs::metadata(path)?;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs() as i64);
-    let size = meta.len() as i64;
-    let checksum = sha256_hex(path)?;
-    Ok((mtime, size, checksum))
-}
-
 /// SHA-256 of the file at `path`, returned as a 64-char lowercase hex
 /// string. Computed in streaming fashion so memory use stays flat for
 /// large files.
@@ -128,98 +99,66 @@ pub fn sha256_hex(path: &Path) -> std::io::Result<String> {
     Ok(s)
 }
 
-/// One historical operation read back from the sqlite history layer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HistoricalOp {
-    pub id: i64,
-    pub action: PlannedAction,
-    pub src_path: PathBuf,
-    pub dst_path: PathBuf,
-    pub src_mtime: i64,
-    pub src_size: i64,
-    /// SHA-256 hex digest of the source file at snapshot time, used to
-    /// verify content integrity before undoing. Empty for legacy rows
-    /// written before the checksum column existed.
-    pub src_checksum: String,
-    pub undone: bool,
+// ---------------------------------------------------------------------------
+// Rollback (session-level undo)
+// ---------------------------------------------------------------------------
+
+/// One file in a rollback unit: the identity `(dir, checksum)` plus the
+/// name to roll back from (`new_name`, current) and to (`old_name`).
+#[derive(Debug, Clone)]
+pub struct RollbackItem {
+    pub dir: PathBuf,
+    pub checksum: String,
+    /// The name the file should be renamed back to (original name).
+    pub old_name: String,
+    /// The name the file currently has.
+    pub new_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UndoOutcome {
+pub enum RollbackOutcome {
     Ok,
-    /// Destination file is missing or has changed since the operation.
+    /// A member's `new_name` file is missing or its content differs.
     DstChanged(String),
-    /// The original src path is now occupied.
+    /// A member's `old_name` path is now occupied.
     SrcOccupied(String),
-    /// IO error during undo.
+    /// IO error during rollback.
     Io(String),
 }
 
-/// Undo a single historical operation, validating against the recorded
-/// snapshot. For rename: dst must exist with same mtime+size+checksum,
-/// src must be empty; reverse-rename. For copy: dst must exist with same
-/// mtime+size+checksum, then delete dst.
-pub fn undo_one(op: &HistoricalOp) -> UndoOutcome {
-    let dst_meta = match fs::metadata(&op.dst_path) {
-        Ok(m) => m,
-        Err(e) => return UndoOutcome::DstChanged(format!("dst missing: {e}")),
-    };
-    let dst_size = dst_meta.len() as i64;
-    let dst_mtime = dst_meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(-1, |d| d.as_secs() as i64);
-
-    if dst_size != op.src_size {
-        return UndoOutcome::DstChanged(format!(
-            "dst size {} != snapshot {}",
-            dst_size, op.src_size
-        ));
-    }
-    if dst_mtime != op.src_mtime {
-        return UndoOutcome::DstChanged(format!(
-            "dst mtime {} != snapshot {}",
-            dst_mtime, op.src_mtime
-        ));
-    }
-    // Content-integrity check. If a checksum was recorded at write
-    // time, recompute it on the dst and refuse to undo if the file has
-    // been altered (mtime/size alone can miss silent rewrites).
-    if !op.src_checksum.is_empty() {
-        match sha256_hex(&op.dst_path) {
-            Ok(current) if current != op.src_checksum => {
-                return UndoOutcome::DstChanged(format!(
-                    "dst checksum {} != snapshot {}",
+/// Roll back a whole unit atomically: first validate every member (the
+/// file is still at `new_name` with a matching checksum, and `old_name`
+/// is free), then rename each member back to `old_name`. Any validation
+/// failure skips the entire unit.
+pub fn rollback_unit(items: &[RollbackItem]) -> RollbackOutcome {
+    for item in items {
+        let new_path = item.dir.join(&item.new_name);
+        let old_path = item.dir.join(&item.old_name);
+        match sha256_hex(&new_path) {
+            Ok(current) if current == item.checksum => {}
+            Ok(current) => {
+                return RollbackOutcome::DstChanged(format!(
+                    "dst checksum {} != recorded {}",
                     &current[..8],
-                    &op.src_checksum[..8]
+                    &item.checksum[..8]
                 ));
             }
             Err(e) => {
-                return UndoOutcome::DstChanged(format!("dst read for checksum failed: {e}"));
+                return RollbackOutcome::DstChanged(format!("dst missing: {e}"));
             }
-            _ => {}
+        }
+        if old_path.exists() {
+            return RollbackOutcome::SrcOccupied(old_path.display().to_string());
         }
     }
-
-    match op.action {
-        PlannedAction::Rename => {
-            // src must be free.
-            if op.src_path.exists() {
-                return UndoOutcome::SrcOccupied(op.src_path.display().to_string());
-            }
-            if let Err(e) = fs::rename(&op.dst_path, &op.src_path) {
-                return UndoOutcome::Io(e.to_string());
-            }
-        }
-        PlannedAction::Copy => {
-            // Reverse of copy = delete the dst.
-            if let Err(e) = fs::remove_file(&op.dst_path) {
-                return UndoOutcome::Io(e.to_string());
-            }
+    for item in items {
+        let new_path = item.dir.join(&item.new_name);
+        let old_path = item.dir.join(&item.old_name);
+        if let Err(e) = fs::rename(&new_path, &old_path) {
+            return RollbackOutcome::Io(e.to_string());
         }
     }
-    UndoOutcome::Ok
+    RollbackOutcome::Ok
 }
 
 // ---------------------------------------------------------------------------
@@ -244,12 +183,25 @@ mod tests {
         std::fs::write(p, content).unwrap();
     }
 
-    #[test]
-    fn rename_same_dir() {
-        let dir = std::env::temp_dir().join(format!("sr_test_{}", std::process::id()));
-        let dir = dir.join("rename_same_dir");
+    fn tmpdir(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "sr_exec_{}_{}_{}",
+            std::process::id(),
+            n,
+            std::thread::current().name().unwrap_or("main")
+        ));
+        let dir = dir.join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn rename_same_dir() {
+        let dir = tmpdir("rename_same_dir");
         let video = dir.join("Show - 01.mkv");
         let sub = dir.join("Show.S01E01.ass");
         write(&video, b"video");
@@ -273,9 +225,7 @@ mod tests {
 
     #[test]
     fn copy_cross_dir() {
-        let root = std::env::temp_dir().join(format!("sr_test_{}", std::process::id()));
-        let root = root.join("copy_cross");
-        let _ = std::fs::remove_dir_all(&root);
+        let root = tmpdir("copy_cross");
         let videos = root.join("videos");
         let subs = root.join("subs");
         std::fs::create_dir_all(&videos).unwrap();
@@ -302,163 +252,106 @@ mod tests {
     }
 
     #[test]
-    fn undo_rename_round_trip() {
-        let dir = std::env::temp_dir().join(format!("sr_test_{}", std::process::id()));
-        let dir = dir.join("undo_rename");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("orig.ass");
-        let dst = dir.join("renamed.ass");
-        write(&src, b"hello");
-        let (mtime, size, checksum) = snapshot(&src).unwrap();
-        std::fs::rename(&src, &dst).unwrap();
-        let hist = HistoricalOp {
-            id: 0,
-            action: PlannedAction::Rename,
-            src_path: src.clone(),
-            dst_path: dst.clone(),
-            src_mtime: mtime,
-            src_size: size,
-            src_checksum: checksum,
-            undone: false,
+    fn rollback_unit_round_trip() {
+        let dir = tmpdir("rollback_ok");
+        let old = dir.join("orig.ass");
+        let new = dir.join("renamed.ass");
+        write(&old, b"hello");
+        let checksum = sha256_hex(&old).unwrap();
+        std::fs::rename(&old, &new).unwrap();
+        let item = RollbackItem {
+            dir: dir.clone(),
+            checksum,
+            old_name: "orig.ass".into(),
+            new_name: "renamed.ass".into(),
         };
-        assert_eq!(undo_one(&hist), UndoOutcome::Ok);
-        assert!(src.exists());
-        assert!(!dst.exists());
+        assert_eq!(rollback_unit(&[item]), RollbackOutcome::Ok);
+        assert!(old.exists());
+        assert!(!new.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn undo_rename_rejects_when_src_occupied() {
-        let dir = std::env::temp_dir().join(format!("sr_test_{}", std::process::id()));
-        let dir = dir.join("undo_occupied");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("orig.ass");
-        let dst = dir.join("renamed.ass");
-        write(&src, b"a");
-        let (mtime, size, checksum) = snapshot(&src).unwrap();
-        std::fs::rename(&src, &dst).unwrap();
-        // Now occupy the src path with another file.
-        write(&src, b"intruder");
-        let hist = HistoricalOp {
-            id: 0,
-            action: PlannedAction::Rename,
-            src_path: src.clone(),
-            dst_path: dst.clone(),
-            src_mtime: mtime,
-            src_size: size,
-            src_checksum: checksum,
-            undone: false,
+    fn rollback_unit_rejects_modified_dst() {
+        let dir = tmpdir("rollback_modified");
+        let old = dir.join("orig.ass");
+        let new = dir.join("renamed.ass");
+        write(&old, b"hello");
+        let checksum = sha256_hex(&old).unwrap();
+        std::fs::rename(&old, &new).unwrap();
+        std::fs::write(&new, b"changed").unwrap();
+        let item = RollbackItem {
+            dir: dir.clone(),
+            checksum,
+            old_name: "orig.ass".into(),
+            new_name: "renamed.ass".into(),
         };
-        match undo_one(&hist) {
-            UndoOutcome::SrcOccupied(_) => {}
+        match rollback_unit(&[item]) {
+            RollbackOutcome::DstChanged(_) => {}
+            other => panic!("expected DstChanged, got {other:?}"),
+        }
+        assert!(new.exists(), "nothing should be renamed on failure");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollback_unit_rejects_occupied_old_name() {
+        let dir = tmpdir("rollback_occupied");
+        let old = dir.join("orig.ass");
+        let new = dir.join("renamed.ass");
+        write(&old, b"a");
+        let checksum = sha256_hex(&old).unwrap();
+        std::fs::rename(&old, &new).unwrap();
+        write(&old, b"intruder");
+        let item = RollbackItem {
+            dir: dir.clone(),
+            checksum,
+            old_name: "orig.ass".into(),
+            new_name: "renamed.ass".into(),
+        };
+        match rollback_unit(&[item]) {
+            RollbackOutcome::SrcOccupied(_) => {}
             other => panic!("expected SrcOccupied, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn undo_rename_rejects_when_dst_modified() {
-        let dir = std::env::temp_dir().join(format!("sr_test_{}", std::process::id()));
-        let dir = dir.join("undo_modified");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("orig.ass");
-        let dst = dir.join("renamed.ass");
-        write(&src, b"a");
-        let (mtime, size, checksum) = snapshot(&src).unwrap();
-        std::fs::rename(&src, &dst).unwrap();
-        // Modify the dst after the rename.
-        std::fs::write(&dst, b"changed").unwrap();
-        let hist = HistoricalOp {
-            id: 0,
-            action: PlannedAction::Rename,
-            src_path: src.clone(),
-            dst_path: dst.clone(),
-            src_mtime: mtime,
-            src_size: size,
-            src_checksum: checksum,
-            undone: false,
-        };
-        match undo_one(&hist) {
-            UndoOutcome::DstChanged(_) => {}
+    fn rollback_unit_skips_whole_unit_when_one_member_fails() {
+        let dir = tmpdir("rollback_unit_fail");
+        let idx_old = dir.join("show.idx");
+        let sub_old = dir.join("show.sub");
+        let idx_new = dir.join("Show - 01.idx");
+        let sub_new = dir.join("Show - 01.sub");
+        write(&idx_old, b"idx");
+        write(&sub_old, b"sub");
+        let idx_checksum = sha256_hex(&idx_old).unwrap();
+        let sub_checksum = sha256_hex(&sub_old).unwrap();
+        std::fs::rename(&idx_old, &idx_new).unwrap();
+        std::fs::rename(&sub_old, &sub_new).unwrap();
+        // Tamper with the .sub member only.
+        std::fs::write(&sub_new, b"tampered").unwrap();
+        let items = vec![
+            RollbackItem {
+                dir: dir.clone(),
+                checksum: idx_checksum,
+                old_name: "show.idx".into(),
+                new_name: "Show - 01.idx".into(),
+            },
+            RollbackItem {
+                dir: dir.clone(),
+                checksum: sub_checksum,
+                old_name: "show.sub".into(),
+                new_name: "Show - 01.sub".into(),
+            },
+        ];
+        match rollback_unit(&items) {
+            RollbackOutcome::DstChanged(_) => {}
             other => panic!("expected DstChanged, got {other:?}"),
         }
+        // Neither member may be renamed (whole unit skipped).
+        assert!(idx_new.exists());
+        assert!(sub_new.exists());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn undo_copy_deletes_dst() {
-        let dir = std::env::temp_dir().join(format!("sr_test_{}", std::process::id()));
-        let dir = dir.join("undo_copy");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("src.ass");
-        let dst = dir.join("dst.ass");
-        write(&src, b"hi");
-        let (mtime, size, checksum) = snapshot(&src).unwrap();
-        std::fs::copy(&src, &dst).unwrap();
-        let hist = HistoricalOp {
-            id: 0,
-            action: PlannedAction::Copy,
-            src_path: src.clone(),
-            dst_path: dst.clone(),
-            src_mtime: mtime,
-            src_size: size,
-            src_checksum: checksum,
-            undone: false,
-        };
-        assert_eq!(undo_one(&hist), UndoOutcome::Ok);
-        assert!(src.exists());
-        assert!(!dst.exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Replace the dst's bytes but preserve size and (where possible)
-    /// mtime. The checksum recorded at snapshot time should still differ
-    /// and undo should be refused — proving the checksum catches content
-    /// tampering that mtime+size would miss.
-    #[test]
-    fn undo_rejects_on_content_tamper_with_same_size() {
-        let dir = std::env::temp_dir().join(format!("sr_test_{}", std::process::id()));
-        let dir = dir.join("undo_content_tamper");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("orig.ass");
-        let dst = dir.join("renamed.ass");
-        write(&src, b"original content here!"); // 22 bytes
-        let (mtime, size, checksum) = snapshot(&src).unwrap();
-        assert!(size > 0);
-        assert!(!checksum.is_empty());
-        std::fs::rename(&src, &dst).unwrap();
-        // Tamper: write a different payload of the SAME length so size
-        // stays equal; explicitly set mtime back to the original to also
-        // defeat the mtime check.
-        std::fs::write(&dst, b"different bytes here!!").unwrap(); // 22 bytes
-        filetime_set(&dst, mtime);
-        let hist = HistoricalOp {
-            id: 0,
-            action: PlannedAction::Rename,
-            src_path: src.clone(),
-            dst_path: dst.clone(),
-            src_mtime: mtime,
-            src_size: size,
-            src_checksum: checksum,
-            undone: false,
-        };
-        match undo_one(&hist) {
-            UndoOutcome::DstChanged(msg) => {
-                assert!(msg.contains("checksum"), "expected checksum rejection, got: {msg}");
-            }
-            other => panic!("expected DstChanged, got {other:?}"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Force a file's mtime to a specific unix-seconds value.
-    fn filetime_set(path: &Path, secs: i64) {
-        let ft = filetime::FileTime::from_unix_time(secs, 0);
-        filetime::set_file_mtime(path, ft).expect("set mtime");
     }
 }

@@ -13,7 +13,7 @@ pub mod plan;
 
 pub use config::{ConfigStore, UserConfig};
 pub use execute::{ExecuteReport, OpOutcome, execute_plan};
-pub use history::{HistoryDb, OperationRecord, SessionRecord};
+pub use history::{HistoryDb, RenameRecord, SessionRecord};
 pub use matcher::{MatchResult, Matcher, PairGroup};
 pub use parse::{EpisodeKey, ExtensionRegistry, FileCategory, RawKey, extract_keys, normalize_key};
 pub use plan::{ActionMode, Conflict, Plan, PlannedOp, SuffixConfig, generate_plan};

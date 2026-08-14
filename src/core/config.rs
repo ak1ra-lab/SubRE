@@ -110,12 +110,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        for &mode in &[ActionMode::Auto, ActionMode::Copy, ActionMode::Move] {
+        for &mode in &[ActionMode::Auto, ActionMode::Copy] {
             let cfg = UserConfig { action_mode: mode, ..UserConfig::default() };
             ConfigStore::save(&cfg, &path).unwrap();
             let loaded = ConfigStore::load(&path).unwrap();
             assert_eq!(loaded.action_mode, mode);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn action_mode_move_degrades_to_auto() {
+        use crate::core::plan::ActionMode;
+        let dir = std::env::temp_dir().join(format!("sr_cfg_move_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "action_mode = \"Move\"\n").unwrap();
+        let loaded = ConfigStore::load(&path).unwrap();
+        assert_eq!(loaded.action_mode, ActionMode::Auto);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

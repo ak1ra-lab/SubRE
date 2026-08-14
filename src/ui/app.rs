@@ -29,11 +29,16 @@ use eframe::egui;
 use egui_extras::TableBuilder;
 
 use crate::core::config::{ConfigStore, UserConfig};
-use crate::core::execute::{ExecuteReport, OpOutcome, execute_plan, snapshot};
-use crate::core::history::{HistoryDb, OperationRecord};
+use crate::core::execute::{
+    ExecuteReport, OpOutcome, RollbackItem, RollbackOutcome, execute_plan, rollback_unit,
+    sha256_hex,
+};
+use crate::core::history::{HistoryDb, RenameRecord};
 use crate::core::matcher::{FileEntry, MatchResult, Matcher, PairGroup};
 use crate::core::parse::{ExtensionRegistry, FileCategory};
-use crate::core::plan::{ActionMode, Conflict, Plan, PlannedAction, SuffixConfig, generate_plan};
+use crate::core::plan::{
+    ActionMode, Conflict, Plan, PlannedAction, PlannedOp, SuffixConfig, generate_plan,
+};
 
 /// Which side a path should be ingested onto when the user explicitly
 /// picks `Browse…` or drops onto a sidebar source region.
@@ -74,13 +79,19 @@ pub struct App {
     /// toolbar.
     pub show_settings: bool,
 
-    // User-selected action policy: Auto (D5 default), Copy (always
-    // preserve originals), or Move (rename/move the subtitle into the
-    // video directory). Persisted in the config so it survives restart.
+    // User-selected action policy: Auto (D5 default) or Copy (always
+    // preserve originals). Persisted in the config so it survives restart.
     pub action_mode: ActionMode,
 
-    // History hint banner.
-    pub history_hint: Vec<OperationRecord>,
+    // History hint banner (checksum-based provenance).
+    pub history_hint: Vec<RenameRecord>,
+
+    /// Per-session undo selection: session id -> per-unit selected flags.
+    pub undo_selection: HashMap<i64, Vec<bool>>,
+
+    /// Ambiguous `(dir, checksum)` identities detected on the subtitle
+    /// side (content collision), for which history is not attributed.
+    pub checksum_collision: Vec<(PathBuf, String)>,
 
     /// Rect of the Video source `CollapsingHeader` in the sidebar,
     /// captured each frame so the drop router can detect "drop on
@@ -124,6 +135,8 @@ impl App {
             show_history: false,
             show_settings: false,
             history_hint: Vec::new(),
+            undo_selection: HashMap::new(),
+            checksum_collision: Vec::new(),
             sidebar_video_rect: None,
             sidebar_subtitle_rect: None,
         }
@@ -192,13 +205,8 @@ impl App {
             s_regex.as_deref(),
         );
 
-        // History hint: any dropped subtitle whose path equals a non-undone dst?
-        self.history_hint.clear();
-        for sub in &self.subtitle_entries {
-            if let Ok(hits) = self.history.find_by_dst(&sub.path) {
-                self.history_hint.extend(hits);
-            }
-        }
+        // History hint: checksum-based provenance of dropped subtitles.
+        self.refresh_history_hint();
 
         let suffix = self.current_suffix_config();
         let plan =
@@ -210,6 +218,42 @@ impl App {
         let n_vids = self.video_entries.len();
         self.status_message =
             format!("{n_vids} video(s), {n_subs} subtitle(s) → {n_groups} pair group(s)");
+    }
+
+    /// Recompute the drag-in history hint and collision warnings from the
+    /// current subtitle entries: hash each subtitle's content and look up
+    /// its `(dir, checksum)` naming history. Same-dir duplicates (content
+    /// collisions) are flagged and excluded from attribution.
+    fn refresh_history_hint(&mut self) {
+        self.history_hint.clear();
+        self.checksum_collision.clear();
+
+        let mut identities: Vec<(PathBuf, String)> = Vec::new();
+        for sub in &self.subtitle_entries {
+            let Some(dir) = sub.path.parent().map(Path::to_path_buf) else {
+                continue;
+            };
+            if let Ok(cs) = sha256_hex(&sub.path) {
+                identities.push((dir, cs));
+            }
+        }
+
+        let mut counts: HashMap<(PathBuf, String), usize> = HashMap::new();
+        for (dir, cs) in &identities {
+            *counts.entry((dir.clone(), cs.clone())).or_default() += 1;
+        }
+        let ambiguous: std::collections::HashSet<(PathBuf, String)> =
+            counts.into_iter().filter(|(_, n)| *n > 1).map(|(k, _)| k).collect();
+        self.checksum_collision = ambiguous.iter().cloned().collect();
+
+        for (dir, cs) in identities {
+            if ambiguous.contains(&(dir.clone(), cs.clone())) {
+                continue;
+            }
+            if let Ok(hits) = self.history.timeline_for(&dir, &cs) {
+                self.history_hint.extend(hits);
+            }
+        }
     }
 
     fn current_suffix_config(&self) -> SuffixConfig {
@@ -264,35 +308,35 @@ impl App {
 
         let mut report = ExecuteReport::default();
         for op in &plan.ops {
-            let (mtime, size, checksum) = match snapshot(&op.subtitle.path) {
-                Ok(v) => v,
-                Err(e) => {
-                    report.outcomes.push(OpOutcome {
-                        op_index: report.outcomes.len(),
-                        success: false,
-                        error: Some(e.to_string()),
-                        src_path: op.subtitle.path.clone(),
-                        dst_path: op.target_path.clone(),
-                        action: op.action,
-                    });
-                    continue;
+            // Only renames produce a history row; copy leaves the source
+            // untouched and is not recorded. Hash before mutating the
+            // filesystem so the recorded identity matches the pre-rename
+            // content.
+            let checksum = if matches!(op.action, PlannedAction::Rename) {
+                match sha256_hex(&op.subtitle.path) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        report.outcomes.push(OpOutcome {
+                            op_index: report.outcomes.len(),
+                            success: false,
+                            error: Some(e.to_string()),
+                            src_path: op.subtitle.path.clone(),
+                            dst_path: op.target_path.clone(),
+                            action: op.action,
+                        });
+                        continue;
+                    }
                 }
+            } else {
+                None
             };
+
             match execute_plan(&Plan { ops: vec![op.clone()] }) {
                 Ok(r) => {
-                    let ok = r.all_ok();
-                    if ok
-                        && let Err(e) = self.history.record_operation(
-                            session_id,
-                            op.action,
-                            &op.subtitle.path,
-                            &op.target_path,
-                            mtime,
-                            size,
-                            &checksum,
-                        )
+                    if r.all_ok()
+                        && let Some(checksum) = &checksum
                     {
-                        self.status_message = format!("history write failed: {e}");
+                        self.record_rename_for_op(session_id, op, checksum);
                     }
                     report.outcomes.extend(r.outcomes);
                 }
@@ -314,31 +358,92 @@ impl App {
         self.refresh_match_and_plan();
     }
 
+    /// Record a successful rename op as a history row for the given session.
+    fn record_rename_for_op(&mut self, session_id: i64, op: &PlannedOp, checksum: &str) {
+        let Some(dir) = op.subtitle.path.parent() else {
+            return;
+        };
+        let (Some(old_name), Some(new_name)) = (
+            op.subtitle.path.file_name().and_then(|n| n.to_str()),
+            op.target_path.file_name().and_then(|n| n.to_str()),
+        ) else {
+            return;
+        };
+        if let Err(e) = self.history.record_rename(
+            session_id,
+            dir,
+            checksum,
+            op.unit_id.as_deref(),
+            old_name,
+            new_name,
+        ) {
+            self.status_message = format!("history write failed: {e}");
+        }
+    }
+
     /// Undo an entire session by id.
     pub fn undo_session(&mut self, session_id: i64) {
-        let ops = match self.history.operations_for_session(session_id) {
-            Ok(o) => o,
+        let renames = match self.history.renames_for_session(session_id) {
+            Ok(r) => r,
             Err(e) => {
                 self.status_message = format!("history read failed: {e}");
                 return;
             }
         };
+        if renames.is_empty() {
+            self.status_message = "Nothing to undo in this session.".into();
+            return;
+        }
+        let units = group_units(&renames);
+        let selection =
+            self.undo_selection.entry(session_id).or_insert_with(|| vec![true; units.len()]);
+        if selection.len() != units.len() {
+            selection.resize(units.len(), true);
+        }
+
+        let undo_session = match self.history.create_undo_session(session_id, None) {
+            Ok(id) => id,
+            Err(e) => {
+                self.status_message = format!("history undo session failed: {e}");
+                return;
+            }
+        };
+
         let mut ok = 0usize;
         let mut bad = 0usize;
-        for op in ops {
-            let hist = op.into_historical();
-            let outcome = crate::core::execute::undo_one(&hist);
-            match outcome {
-                crate::core::execute::UndoOutcome::Ok => {
-                    if let Err(e) = self.history.mark_undone(hist.id) {
-                        self.status_message = format!("history update failed: {e}");
+        for (i, unit) in units.iter().enumerate() {
+            if !selection[i] {
+                continue;
+            }
+            let items: Vec<RollbackItem> = unit
+                .iter()
+                .map(|r| RollbackItem {
+                    dir: PathBuf::from(&r.dir),
+                    checksum: r.checksum.clone(),
+                    old_name: r.old_name.clone(),
+                    new_name: r.new_name.clone(),
+                })
+                .collect();
+            match rollback_unit(&items) {
+                RollbackOutcome::Ok => {
+                    for r in unit {
+                        if let Err(e) = self.history.record_rename(
+                            undo_session,
+                            Path::new(&r.dir),
+                            &r.checksum,
+                            r.unit_id.as_deref(),
+                            &r.new_name,
+                            &r.old_name,
+                        ) {
+                            self.status_message = format!("history write failed: {e}");
+                        }
                     }
                     ok += 1;
                 }
                 _ => bad += 1,
             }
         }
-        self.status_message = format!("Undo: {ok} ok, {bad} failed");
+        self.status_message = format!("Undo: {ok} unit(s) ok, {bad} failed");
         self.refresh_match_and_plan();
     }
 
@@ -485,7 +590,6 @@ impl App {
                 .selected_text(match self.action_mode {
                     ActionMode::Auto => "Auto",
                     ActionMode::Copy => "Always Copy",
-                    ActionMode::Move => "Always Move",
                 })
                 .show_ui(ui, |ui| {
                     if ui
@@ -506,19 +610,6 @@ impl App {
                         .clicked()
                     {
                         self.action_mode = ActionMode::Copy;
-                        self.refresh_match_and_plan();
-                    }
-                    if ui
-                        .selectable_label(
-                            matches!(self.action_mode, ActionMode::Move),
-                            "Always Move (destructive)",
-                        )
-                        .on_hover_text(
-                            "Subtitles are renamed across directories; the source file is removed.",
-                        )
-                        .clicked()
-                    {
-                        self.action_mode = ActionMode::Move;
                         self.refresh_match_and_plan();
                     }
                 });
@@ -575,6 +666,17 @@ impl App {
     // -----------------------------------------------------------------
 
     fn render_central(&mut self, ui: &mut egui::Ui) {
+        for (dir, checksum) in &self.checksum_collision {
+            ui.colored_label(
+                egui::Color32::RED,
+                format!(
+                    "Content collision in {}: multiple subtitles share checksum {} — history not attributed.",
+                    dir.display(),
+                    &checksum[..8]
+                ),
+            );
+        }
+
         if !self.history_hint.is_empty() {
             ui.colored_label(
                 egui::Color32::YELLOW,
@@ -796,38 +898,57 @@ impl App {
                 .resizable(true)
                 .default_size(egui::vec2(600.0, 400.0))
                 .show(ctx, |ui| {
-                    match self.history.list_sessions() {
-                        Ok(sessions) => {
-                            if sessions.is_empty() {
-                                ui.label("(no history yet)");
-                            }
-                            for s in &sessions {
-                                ui.collapsing(
-                                    format!("session #{} — {}", s.id, s.created_at),
-                                    |ui| {
-                                        if let Ok(ops) = self.history.operations_for_session(s.id) {
-                                            ui.label(format!("{} operation(s)", ops.len()));
-                                            for o in &ops {
-                                                ui.label(format!(
-                                                    "  [{}] {} → {} ({}{})",
-                                                    if o.undone { "x" } else { " " },
-                                                    o.src_path,
-                                                    o.dst_path,
-                                                    o.action,
-                                                    if o.undone { " undone" } else { "" }
-                                                ));
-                                            }
-                                            if ui.button("Undo session").clicked() {
-                                                self.undo_session(s.id);
-                                            }
-                                        }
-                                    },
-                                );
-                            }
-                        }
+                    let sessions = match self.history.list_sessions() {
+                        Ok(s) => s,
                         Err(e) => {
                             ui.label(format!("history read failed: {e}"));
+                            Vec::new()
                         }
+                    };
+                    if sessions.is_empty() {
+                        ui.label("(no history yet)");
+                    }
+                    let mut to_undo: Option<i64> = None;
+                    for s in &sessions {
+                        let title = match s.undo_of {
+                            Some(orig) => format!(
+                                "session #{} — {} (undo of #{})",
+                                s.id,
+                                format_epoch(s.created_at),
+                                orig
+                            ),
+                            None => {
+                                format!("session #{} — {}", s.id, format_epoch(s.created_at))
+                            }
+                        };
+                        ui.collapsing(title, |ui| match self.history.renames_for_session(s.id) {
+                            Ok(renames) => {
+                                let units = group_units(&renames);
+                                if units.is_empty() {
+                                    ui.label("(no renames — copy-only session)");
+                                } else {
+                                    let selection = self
+                                        .undo_selection
+                                        .entry(s.id)
+                                        .or_insert_with(|| vec![true; units.len()]);
+                                    if selection.len() != units.len() {
+                                        selection.resize(units.len(), true);
+                                    }
+                                    for (i, unit) in units.iter().enumerate() {
+                                        ui.checkbox(&mut selection[i], unit_label(unit));
+                                    }
+                                    if ui.button("Undo selected").clicked() {
+                                        to_undo = Some(s.id);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                ui.label(format!("history read failed: {e}"));
+                            }
+                        });
+                    }
+                    if let Some(sid) = to_undo {
+                        self.undo_session(sid);
                     }
                     if ui.button("Close").clicked() {
                         self.show_history = false;
@@ -844,6 +965,61 @@ impl App {
 fn non_empty(s: &str) -> Option<String> {
     let t = s.trim();
     if t.is_empty() { None } else { Some(t.to_string()) }
+}
+
+/// Group a session's rename records into rollback units: records sharing
+/// a `unit_id` are one unit (`.idx`+`.sub`); `None` records are their own
+/// singleton unit. Order is preserved.
+fn group_units(renames: &[RenameRecord]) -> Vec<Vec<RenameRecord>> {
+    let mut units: Vec<Vec<RenameRecord>> = Vec::new();
+    let mut index_by_unit: HashMap<String, usize> = HashMap::new();
+    for r in renames {
+        match &r.unit_id {
+            Some(uid) => {
+                if let Some(&i) = index_by_unit.get(uid) {
+                    units[i].push(r.clone());
+                } else {
+                    index_by_unit.insert(uid.clone(), units.len());
+                    units.push(vec![r.clone()]);
+                }
+            }
+            None => units.push(vec![r.clone()]),
+        }
+    }
+    units
+}
+
+/// Human-readable one-line summary of a rollback unit.
+fn unit_label(unit: &[RenameRecord]) -> String {
+    unit.iter()
+        .map(|r| format!("{} → {}", r.old_name, r.new_name))
+        .collect::<Vec<_>>()
+        .join("  ·  ")
+}
+
+/// Format an epoch-seconds timestamp as a UTC `YYYY-MM-DD HH:MM:SS`
+/// string, without pulling in a date library.
+fn format_epoch(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let hh = rem / 3600;
+    let mm = (rem % 3600) / 60;
+    let ss = rem % 60;
+
+    // Howard Hinnant's `civil_from_days` algorithm.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}")
 }
 
 /// Render a file as its basename only. The directory is shown in the

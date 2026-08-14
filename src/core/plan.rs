@@ -80,10 +80,8 @@ pub struct PlannedOp {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlannedAction {
-    /// Move via rename — same directory OR across directories on the same
-    /// filesystem (atomic), or copy+delete across filesystems. **Deletes
-    /// the source file.** Reversed by undo with the same validation as
-    /// copy.
+    /// Move via in-place rename (same directory). **Deletes the source
+    /// file.** Reversed by undo.
     Rename,
     /// Copy the source to the target directory, leaving the source
     /// untouched. **Does not delete the source.** Reversed by undo with
@@ -99,9 +97,8 @@ pub enum Conflict {
     /// The target path already exists on disk (and is not part of this plan
     /// as a source).
     TargetExists(PathBuf),
-    /// The requested action is not possible for this op (e.g. Rename
-    /// across filesystems when the user asked for Move mode but the
-    /// target directory is the same as the source — degenerate case).
+    /// The requested action is not possible for this op. Reserved for
+    /// future action constraints; currently unused.
     ActionUnsupported(PathBuf),
 }
 
@@ -111,7 +108,7 @@ pub enum Conflict {
 /// The default (`Auto`) follows design D5: same directory → rename in
 /// place; different directory → copy (preserve originals). Other modes
 /// override that policy uniformly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub enum ActionMode {
     /// Same-dir Rename, cross-dir Copy. Honors design D5. **Default.**
     #[default]
@@ -119,10 +116,37 @@ pub enum ActionMode {
     /// Always Copy — never touch the source file. Safe even across
     /// filesystems.
     Copy,
-    /// Always Rename — move the subtitle into the video directory. The
-    /// source file is deleted as part of the rename (or copy+delete if
-    /// the two directories are on different filesystems).
-    Move,
+}
+
+impl<'de> Deserialize<'de> for ActionMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = ActionMode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("`Auto` or `Copy` (legacy `Move` maps to `Auto`)")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "Copy" => Ok(ActionMode::Copy),
+                    // `Auto` and legacy `Move` both resolve to the default.
+                    "Auto" | "Move" => Ok(ActionMode::Auto),
+                    other => Err(E::custom(format!("unknown action mode `{other}`"))),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(Visitor)
+    }
 }
 
 /// A complete plan.
@@ -229,7 +253,6 @@ pub fn generate_plan(
                         }
                     }
                     ActionMode::Copy => PlannedAction::Copy,
-                    ActionMode::Move => PlannedAction::Rename,
                 };
 
                 ops.push(PlannedOp {
@@ -449,15 +472,5 @@ mod tests {
         let r = m.match_files(&v, &s, None, None);
         let plan = generate_plan(&r, &SuffixConfig::default(), &NoExists, ActionMode::Copy);
         assert_eq!(plan.ops[0].action, PlannedAction::Copy);
-    }
-
-    #[test]
-    fn action_mode_move_overrides_copy() {
-        let m = Matcher::new();
-        let v = vec![entry("/videos/Show - 01.mkv")];
-        let s = vec![entry("/subs/Show.S01E01.ass")];
-        let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &SuffixConfig::default(), &NoExists, ActionMode::Move);
-        assert_eq!(plan.ops[0].action, PlannedAction::Rename);
     }
 }
