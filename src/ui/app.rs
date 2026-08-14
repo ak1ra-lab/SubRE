@@ -1,16 +1,25 @@
 //! eframe App implementation for the subtitle-renamer GUI.
 //!
-//! Top to bottom:
-//!   1. Top: suffix/matching config (global suffix, token-map editor,
-//!      regex overrides).
-//!   2. Three-column table (video | subtitle(s) | target preview).
-//!   3. Unmatched / unknown lists (collapsible).
-//!   4. History hint banner.
-//!   5. Status + Apply / History buttons.
+//! Layout (eframe 4-zone):
+//!   - `SidePanel`: two `CollapsingHeader`s (`📁 Video source` /
+//!     `📁 Subtitle source`) with Browse / Clear buttons; their rects
+//!     are captured each frame so the drop router can force-side drops
+//!     landing on them. A `🗑 Clear all` button at the bottom clears
+//!     both sides + unknowns + history hint.
+//!   - `TopBottomPanel::top` (toolbar): `Action:` `ComboBox` on the left,
+//!     `▶ Apply` (green, rightmost), `📜 History`, `⚙ Settings`,
+//!     `📋 Copy mv` packed right-to-left.
+//!   - `TopBottomPanel::bottom` (status): multi-line `Video dir:` /
+//!     `Subtitle dir:` (full paths in monospace, never truncated;
+//!     multi-folder shows `N folders` with hover listing all paths)
+//!     + `status_message`.
+//!   - `CentralPanel`: history hint banner (if any), inline `⚙ Settings`
+//!     collapsing header, three-column `TableBuilder`,
+//!     `Unmatched / unknown` collapsing.
 //!
-//! Plan generation is driven by `core::plan::generate_plan`; the
-//! `MatchResult` and `Plan` are recomputed every time the user changes
-//! any config field, so the preview is always current.
+//! Drop handling is centralized in [`App::process_drops`]: it runs
+//! between sidebar render (which populates `sidebar_video_rect` /
+//! `sidebar_subtitle_rect`) and toolbar render.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -27,7 +36,7 @@ use crate::core::parse::{ExtensionRegistry, FileCategory};
 use crate::core::plan::{ActionMode, Conflict, Plan, PlannedAction, SuffixConfig, generate_plan};
 
 /// Which side a path should be ingested onto when the user explicitly
-/// picks "Open Video…" or "Open Subtitle…".
+/// picks `Browse…` or drops onto a sidebar source region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForcedSide {
     Video,
@@ -57,9 +66,13 @@ pub struct App {
     pub video_regex_input: String,
     pub subtitle_regex_input: String,
 
-    // Modal toggles.
+    // Modal / panel toggles.
     pub show_confirm: bool,
     pub show_history: bool,
+    /// Whether the inline Settings `CollapsingHeader` in `CentralPanel`
+    /// is forced open. Toggled by the `⚙ Settings` button in the top
+    /// toolbar.
+    pub show_settings: bool,
 
     // User-selected action policy: Auto (D5 default), Copy (always
     // preserve originals), or Move (rename/move the subtitle into the
@@ -68,6 +81,13 @@ pub struct App {
 
     // History hint banner.
     pub history_hint: Vec<OperationRecord>,
+
+    /// Rect of the Video source `CollapsingHeader` in the sidebar,
+    /// captured each frame so the drop router can detect "drop on
+    /// Video source" via `pointer.hover_pos()`.
+    pub sidebar_video_rect: Option<egui::Rect>,
+    /// Rect of the Subtitle source `CollapsingHeader` in the sidebar.
+    pub sidebar_subtitle_rect: Option<egui::Rect>,
 }
 
 impl App {
@@ -102,11 +122,16 @@ impl App {
             status_message: String::from("Drop files or a folder into the window to start."),
             show_confirm: false,
             show_history: false,
+            show_settings: false,
             history_hint: Vec::new(),
+            sidebar_video_rect: None,
+            sidebar_subtitle_rect: None,
         }
     }
 
-    /// Ingest a list of dropped paths: classify and recurse into folders.
+    /// Ingest a list of dropped paths: classify by extension and recurse
+    /// into folders. Used for drops that land outside the sidebar source
+    /// regions (auto-classify).
     pub fn ingest_paths<I>(&mut self, paths: I)
     where
         I: IntoIterator<Item = PathBuf>,
@@ -118,9 +143,9 @@ impl App {
     }
 
     /// Ingest paths and force them onto a specific side, bypassing the
-    /// extension-based categorizer. Used by the explicit "Open Video…"
-    /// and "Open Subtitle…" buttons when the user wants to override the
-    /// default classification.
+    /// extension-based categorizer. Used by sidebar `Browse…` buttons
+    /// and by the drop router when a drop lands on a sidebar source
+    /// rect.
     pub fn ingest_paths_as<I>(&mut self, paths: I, side: ForcedSide)
     where
         I: IntoIterator<Item = PathBuf>,
@@ -316,271 +341,251 @@ impl App {
         self.status_message = format!("Undo: {ok} ok, {bad} failed");
         self.refresh_match_and_plan();
     }
-}
 
-fn non_empty(s: &str) -> Option<String> {
-    let t = s.trim();
-    if t.is_empty() { None } else { Some(t.to_string()) }
-}
+    // -----------------------------------------------------------------
+    // Drop router
+    // -----------------------------------------------------------------
 
-/// Render a path as "basename  (in <parent>)" — short enough for table
-/// rows while still telling the user where the file lives.
-/// Render a file as its basename only. The directory is shown once in
-/// the bottom action bar (per source side), not in every row — that
-/// keeps long filenames readable when they happen to come from deeply
-/// nested folders like
-/// `/mnt/tank/media/anime/releases/[Seed-Raws] Death_Note (BD 1280x720 AVC AAC)`.
-fn path_label(p: &crate::core::matcher::FileEntry) -> String {
-    p.path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map_or_else(|| p.path.display().to_string(), std::string::ToString::to_string)
-}
-
-/// Shorten a path for compact display, keeping the trailing components
-/// (where the files actually live). The full path stays available via
-/// the hover tooltip on the rendered widget.
-fn truncate_path_for_display(p: &Path, max_chars: usize) -> String {
-    let s = p.display().to_string();
-    if s.chars().count() <= max_chars {
-        return s;
-    }
-    // Keep the tail: take components from the end until we fit.
-    let parts: Vec<&str> = s.split('/').collect();
-    let mut out = String::new();
-    let mut count = 0usize;
-    for part in parts.iter().rev() {
-        let addition = if out.is_empty() { part.len() } else { part.len() + 1 };
-        if count + addition + 3 > max_chars {
-            // 3 chars for "…/".
-            break;
-        }
-        if out.is_empty() {
-            out = part.to_string();
-        } else {
-            out = format!("{part}/{out}");
-        }
-        count += addition;
-    }
-    if parts.len() > 1 && !out.starts_with("…/") && count < s.len() {
-        format!("…/{out}")
-    } else {
-        out
-    }
-}
-
-/// Render a per-side directory indicator in the bottom action bar.
-/// Shows the common parent of the side's entries, or "<n> folders" if
-/// the entries come from multiple distinct parents. The full list of
-/// distinct parents is in the hover tooltip.
-fn render_dir_indicator(
-    ui: &mut egui::Ui,
-    label: &str,
-    entries: &[crate::core::matcher::FileEntry],
-) {
-    if entries.is_empty() {
-        return;
-    }
-    let parents: Vec<PathBuf> =
-        entries.iter().filter_map(|e| e.path.parent().map(std::path::Path::to_path_buf)).collect();
-    // Deduplicate while preserving order.
-    let mut seen = std::collections::HashSet::new();
-    let unique: Vec<PathBuf> = parents.into_iter().filter(|p| seen.insert(p.clone())).collect();
-
-    ui.label(format!("{label}:"));
-
-    if unique.len() == 1 {
-        let full = unique[0].display().to_string();
-        let display = truncate_path_for_display(&unique[0], 40);
-        ui.monospace(display).on_hover_text(&full);
-    } else {
-        ui.monospace(format!("{} folders", unique.len())).on_hover_text({
-            let mut s = String::new();
-            for p in &unique {
-                if !s.is_empty() {
-                    s.push('\n');
-                }
-                s.push_str(&p.display().to_string());
-            }
-            s
+    /// Route any dropped files for this frame. Called after the
+    /// `SidePanel` has rendered (so the source rects are populated) and
+    /// before the toolbar renders. Drops whose pointer position lands
+    /// on a sidebar source rect are routed to that side; everything
+    /// else falls through to extension auto-classify via
+    /// [`App::ingest_paths`].
+    fn process_drops(&mut self, ctx: &egui::Context) {
+        let video_rect = self.sidebar_video_rect;
+        let subtitle_rect = self.sidebar_subtitle_rect;
+        let (paths, hover) = ctx.input(|i| {
+            let paths: Vec<PathBuf> =
+                i.raw.dropped_files.iter().filter_map(|d| d.path.clone()).collect();
+            (paths, i.pointer.hover_pos())
         });
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Rendering helpers
-// ---------------------------------------------------------------------------
-
-fn preview_for_group(group: &PairGroup, plan: Option<&Plan>) -> String {
-    let Some(plan) = plan else {
-        return String::new();
-    };
-    let mut previews = Vec::new();
-    for op in &plan.ops {
-        let same_video = group
-            .video
-            .as_ref()
-            .is_some_and(|v| Some(&v.path) == op.video.as_ref().map(|o| &o.path));
-        let in_subs = group.subtitles.iter().any(|s| s.path == op.subtitle.path);
-        if same_video || in_subs {
-            previews.push(op.target_basename.clone());
+        if paths.is_empty() {
+            return;
+        }
+        let forced = hover.and_then(|p| {
+            if video_rect.is_some_and(|r| r.contains(p)) {
+                Some(ForcedSide::Video)
+            } else if subtitle_rect.is_some_and(|r| r.contains(p)) {
+                Some(ForcedSide::Subtitle)
+            } else {
+                None
+            }
+        });
+        match forced {
+            Some(side) => self.ingest_paths_as(paths, side),
+            None => self.ingest_paths(paths),
         }
     }
-    if previews.is_empty() { "(no plan)".into() } else { previews.join(" | ") }
-}
 
-fn group_has_conflict(group: &PairGroup, plan: &Plan) -> bool {
-    plan.ops.iter().any(|o| {
-        let same_video = group
-            .video
-            .as_ref()
-            .is_some_and(|v| Some(&v.path) == o.video.as_ref().map(|vv| &vv.path));
-        let in_subs = group.subtitles.iter().any(|s| s.path == o.subtitle.path);
-        (same_video || in_subs) && !o.conflicts.is_empty()
-    })
-}
+    // -----------------------------------------------------------------
+    // Side panel
+    // -----------------------------------------------------------------
 
-#[allow(dead_code)]
-fn conflict_summary(c: &Conflict) -> &'static str {
-    match c {
-        Conflict::DuplicateTarget(_) => "duplicate",
-        Conflict::TargetExists(_) => "exists",
-        Conflict::ActionUnsupported(_) => "unsupported",
-    }
-}
+    fn render_sidebar(&mut self, ui: &mut egui::Ui) {
+        self.render_video_source(ui);
+        self.render_subtitle_source(ui);
 
-/// Render the current plan as a shell script (mv / cp lines). This is the
-/// "copy mv command to clipboard" feature called out in design's Open
-/// Questions — useful when the user wants to hand-review the operations
-/// before applying.
-fn mv_script(plan: &Plan) -> String {
-    let mut out = String::from("#!/bin/sh\n# generated by subtitle-renamer\n");
-    for op in &plan.ops {
-        let cmd = match op.action {
-            PlannedAction::Rename => "mv",
-            PlannedAction::Copy => "cp",
-        };
-        let src = shell_quote(&op.subtitle.path.display().to_string());
-        let dst = shell_quote(&op.target_path.display().to_string());
-        let _ = writeln!(out, "{cmd} {src} {dst}");
-    }
-    out
-}
+        ui.separator();
 
-fn shell_quote(s: &str) -> String {
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || "/-_=.,:@%+".contains(c)) {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', "'\\''"))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// eframe::App
-// ---------------------------------------------------------------------------
-
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Drop zone: convert dropped files into our internal state.
-        let dropped: Vec<PathBuf> =
-            ui.ctx().input(|i| i.raw.dropped_files.iter().filter_map(|d| d.path.clone()).collect());
-        if !dropped.is_empty() {
-            self.ingest_paths(dropped);
+        if ui.button("🗑 Clear all").clicked() {
+            self.video_entries.clear();
+            self.subtitle_entries.clear();
+            self.unknown_entries.clear();
+            self.history_hint.clear();
+            self.refresh_match_and_plan();
         }
+    }
 
-        // Top: open-file toolbar + drop hint.
+    fn render_video_source(&mut self, ui: &mut egui::Ui) {
+        let pre = ui.min_rect();
+        egui::CollapsingHeader::new("📁 Video source").default_open(true).show(ui, |ui| {
+            self.render_video_source_body(ui);
+        });
+        let post = ui.min_rect();
+        self.sidebar_video_rect = Some(egui::Rect::from_min_max(pre.min, post.max));
+    }
+
+    fn render_subtitle_source(&mut self, ui: &mut egui::Ui) {
+        let pre = ui.min_rect();
+        egui::CollapsingHeader::new("📁 Subtitle source").default_open(true).show(ui, |ui| {
+            self.render_subtitle_source_body(ui);
+        });
+        let post = ui.min_rect();
+        self.sidebar_subtitle_rect = Some(egui::Rect::from_min_max(pre.min, post.max));
+    }
+
+    fn render_video_source_body(&mut self, ui: &mut egui::Ui) {
+        let n = self.video_entries.len();
+        if n == 0 {
+            ui.label("No files yet — drop here or click Browse.");
+        } else {
+            let parents = unique_parents(&self.video_entries);
+            if parents.len() == 1 {
+                ui.label(format!("Dir: {}", parents[0].display()));
+            } else {
+                let tooltip: String =
+                    parents.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n");
+                ui.label(format!("{n} files from {} folders", parents.len()))
+                    .on_hover_text(tooltip);
+            }
+        }
         ui.horizontal(|ui| {
-            ui.label("Add files:");
-            if ui.button("Open Video files…").clicked()
+            if ui.button("📁 Browse…").clicked()
                 && let Some(paths) =
                     rfd::FileDialog::new().set_title("Select video files").pick_files()
             {
                 self.ingest_paths_as(paths, ForcedSide::Video);
             }
-            if ui.button("Open Video folder…").clicked()
-                && let Some(folder) =
-                    rfd::FileDialog::new().set_title("Select a folder of videos").pick_folder()
-            {
-                self.ingest_paths_as(vec![folder], ForcedSide::Video);
+            if ui.button("🗑 Clear").clicked() {
+                self.video_entries.clear();
+                self.refresh_match_and_plan();
             }
-            if ui.button("Open Subtitle files…").clicked()
+        });
+    }
+
+    fn render_subtitle_source_body(&mut self, ui: &mut egui::Ui) {
+        let n = self.subtitle_entries.len();
+        if n == 0 {
+            ui.label("No files yet — drop here or click Browse.");
+        } else {
+            let parents = unique_parents(&self.subtitle_entries);
+            if parents.len() == 1 {
+                ui.label(format!("Dir: {}", parents[0].display()));
+            } else {
+                let tooltip: String =
+                    parents.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n");
+                ui.label(format!("{n} files from {} folders", parents.len()))
+                    .on_hover_text(tooltip);
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui.button("📁 Browse…").clicked()
                 && let Some(paths) =
                     rfd::FileDialog::new().set_title("Select subtitle files").pick_files()
             {
                 self.ingest_paths_as(paths, ForcedSide::Subtitle);
             }
-            if ui.button("Open Subtitle folder…").clicked()
-                && let Some(folder) =
-                    rfd::FileDialog::new().set_title("Select a folder of subtitles").pick_folder()
-            {
-                self.ingest_paths_as(vec![folder], ForcedSide::Subtitle);
-            }
-            if ui.button("Open (auto-classify)…").clicked()
-                && let Some(paths) = rfd::FileDialog::new()
-                    .set_title("Select files or folders (auto-classify)")
-                    .pick_files()
-            {
-                self.ingest_paths(paths);
-            }
-            if ui.button("Clear").clicked() {
-                self.video_entries.clear();
+            if ui.button("🗑 Clear").clicked() {
                 self.subtitle_entries.clear();
-                self.unknown_entries.clear();
-                self.history_hint.clear();
                 self.refresh_match_and_plan();
             }
         });
-        ui.label("Tip: you can also drag files / folders directly into this window.");
+    }
 
-        ui.separator();
+    // -----------------------------------------------------------------
+    // Top toolbar
+    // -----------------------------------------------------------------
 
-        // Top: suffix + matching config.
-        ui.collapsing("Suffix / matching config", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Global suffix:");
-                if ui.text_edit_singleline(&mut self.global_suffix_input).changed() {
-                    self.refresh_match_and_plan();
-                }
-                ui.checkbox(&mut self.auto_extract_toggle, "Auto-detect language token");
-                if ui.button("Save config").clicked() {
-                    let cfg = self.current_config();
-                    if let Err(e) = ConfigStore::save_default(&cfg) {
-                        self.status_message = format!("config save failed: {e}");
-                    } else {
-                        self.config = cfg;
+    fn render_toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            // Action mode on the left of the toolbar (reading order).
+            ui.label("Action:");
+            egui::ComboBox::from_id_salt("action_mode")
+                .selected_text(match self.action_mode {
+                    ActionMode::Auto => "Auto",
+                    ActionMode::Copy => "Always Copy",
+                    ActionMode::Move => "Always Move",
+                })
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(matches!(self.action_mode, ActionMode::Auto), "Auto (D5)")
+                        .clicked()
+                    {
+                        self.action_mode = ActionMode::Auto;
+                        self.refresh_match_and_plan();
                     }
-                }
-            });
-            ui.label("Token → suffix map:");
-            let mut to_remove: Option<usize> = None;
-            for (i, (k, v)) in self.token_map_editor.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(k);
-                    ui.label("→");
-                    ui.text_edit_singleline(v);
-                    if ui.button("x").clicked() {
-                        to_remove = Some(i);
+                    if ui
+                        .selectable_label(
+                            matches!(self.action_mode, ActionMode::Copy),
+                            "Always Copy (safe)",
+                        )
+                        .on_hover_text(
+                            "Subtitles are copied into the video folder; originals stay put.",
+                        )
+                        .clicked()
+                    {
+                        self.action_mode = ActionMode::Copy;
+                        self.refresh_match_and_plan();
+                    }
+                    if ui
+                        .selectable_label(
+                            matches!(self.action_mode, ActionMode::Move),
+                            "Always Move (destructive)",
+                        )
+                        .on_hover_text(
+                            "Subtitles are renamed across directories; the source file is removed.",
+                        )
+                        .clicked()
+                    {
+                        self.action_mode = ActionMode::Move;
+                        self.refresh_match_and_plan();
                     }
                 });
-            }
-            if let Some(i) = to_remove {
-                self.token_map_editor.remove(i);
-                self.refresh_match_and_plan();
-            }
-            if ui.button("+ add mapping").clicked() {
-                self.token_map_editor.push((String::new(), String::new()));
-            }
-            ui.horizontal(|ui| {
-                ui.label("Video regex (fallback):");
-                if ui.text_edit_singleline(&mut self.video_regex_input).changed() {
-                    self.refresh_match_and_plan();
+
+            // Right-to-left cluster: Apply is rightmost (highest weight).
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let can_apply =
+                    self.plan.as_ref().is_some_and(|p| !p.ops.is_empty() && !p.has_conflicts());
+
+                if ui
+                    .add_enabled(
+                        can_apply,
+                        egui::Button::new("▶ Apply").fill(egui::Color32::from_rgb(60, 130, 60)),
+                    )
+                    .on_hover_text("Apply the rename/copy plan to disk")
+                    .clicked()
+                {
+                    self.show_confirm = true;
                 }
-                ui.label("Subtitle regex:");
-                if ui.text_edit_singleline(&mut self.subtitle_regex_input).changed() {
-                    self.refresh_match_and_plan();
+
+                ui.toggle_value(&mut self.show_history, "📜 History");
+                ui.toggle_value(&mut self.show_settings, "⚙ Settings");
+
+                if ui
+                    .add_enabled(can_apply, egui::Button::new("📋 Copy mv"))
+                    .on_hover_text("Copy the generated mv/cp script to the clipboard")
+                    .clicked()
+                    && let Some(plan) = &self.plan
+                {
+                    let script = mv_script(plan);
+                    ui.ctx().copy_text(script);
+                    self.status_message = "Copied mv script to clipboard.".into();
                 }
             });
         });
+    }
+
+    // -----------------------------------------------------------------
+    // Bottom status bar
+    // -----------------------------------------------------------------
+
+    fn render_status_bar(&self, ui: &mut egui::Ui) {
+        ui.vertical(|ui| {
+            ui.label("Video dir:");
+            render_side_dirs(ui, &self.video_entries);
+            ui.label("Subtitle dir:");
+            render_side_dirs(ui, &self.subtitle_entries);
+            ui.label(&self.status_message);
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // Central panel
+    // -----------------------------------------------------------------
+
+    fn render_central(&mut self, ui: &mut egui::Ui) {
+        if !self.history_hint.is_empty() {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                format!(
+                    "{} dropped subtitle(s) match history records — see History panel to undo.",
+                    self.history_hint.len()
+                ),
+            );
+        }
+
+        self.render_settings(ui);
 
         ui.separator();
 
@@ -671,7 +676,6 @@ impl eframe::App for App {
                 }
             });
 
-        // Unmatched / unknown.
         ui.collapsing("Unmatched / unknown", |ui| {
             if let Some(result) = &self.match_result {
                 let unmatched_v: Vec<&FileEntry> = result.unmatched_videos().collect();
@@ -693,120 +697,69 @@ impl eframe::App for App {
                 }
             }
         });
+    }
 
-        // History hint banner.
-        if !self.history_hint.is_empty() {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                format!(
-                    "{} dropped subtitle(s) match history records — see History panel to undo.",
-                    self.history_hint.len()
-                ),
-            );
-        }
-
-        ui.separator();
-
-        // Bottom action bar — compact, one horizontal row. Contains:
-        //   • per-side source directories (Video dir, Subtitle dir)
-        //   • status message
-        //   • action-mode selector (Auto / Copy / Move)
-        //   • Apply button (prominent)
-        //   • Copy mv / History buttons
-        ui.horizontal(|ui| {
-            // Per-side directory indicators. Each side shows its common
-            // parent if all of its files share one, otherwise a count.
-            // The full list of distinct parents is in the hover tooltip.
-            render_dir_indicator(ui, "Video dir", &self.video_entries);
-            render_dir_indicator(ui, "Subtitle dir", &self.subtitle_entries);
-
-            ui.separator();
-
-            ui.label(&self.status_message);
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let can_apply =
-                    self.plan.as_ref().is_some_and(|p| !p.ops.is_empty() && !p.has_conflicts());
-
-                // Apply is the most important button — make it the rightmost.
-                if ui
-                    .add_enabled(
-                        can_apply,
-                        egui::Button::new("▶ Apply").fill(egui::Color32::from_rgb(60, 130, 60)),
-                    )
-                    .on_hover_text("Apply the rename/copy plan to disk")
-                    .clicked()
-                {
-                    self.show_confirm = true;
+    fn render_settings(&mut self, ui: &mut egui::Ui) {
+        // The header's open state is locked to `show_settings`, which
+        // is toggled by the `⚙ Settings` button in the toolbar — so
+        // users can't bypass the toolbar by clicking the header.
+        egui::CollapsingHeader::new("⚙ Settings ▾").open(Some(self.show_settings)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Global suffix:");
+                if ui.text_edit_singleline(&mut self.global_suffix_input).changed() {
+                    self.refresh_match_and_plan();
                 }
-                if ui.button("History").clicked() {
-                    self.show_history = true;
-                }
-                if ui
-                    .add_enabled(can_apply, egui::Button::new("Copy mv"))
-                    .on_hover_text("Copy the generated mv/cp script to the clipboard")
-                    .clicked()
-                    && let Some(plan) = &self.plan
-                {
-                    let script = mv_script(plan);
-                    ui.ctx().copy_text(script);
-                    self.status_message = "Copied mv script to clipboard.".into();
+                ui.checkbox(&mut self.auto_extract_toggle, "Auto-detect language token");
+                if ui.button("Save config").clicked() {
+                    let cfg = self.current_config();
+                    if let Err(e) = ConfigStore::save_default(&cfg) {
+                        self.status_message = format!("config save failed: {e}");
+                    } else {
+                        self.config = cfg;
+                    }
                 }
             });
-
-            // Action-mode selector on its own row above-right to avoid
-            // crowding the action buttons. We render it in the same
-            // horizontal layout, but in a wrapping sub-row.
-        });
-        ui.horizontal(|ui| {
-            ui.label("Action on cross-dir subtitles:");
-            egui::ComboBox::from_id_salt("action_mode")
-                .selected_text(match self.action_mode {
-                    ActionMode::Auto => "Auto (D5: same-dir rename, cross-dir copy)",
-                    ActionMode::Copy => "Always Copy (preserve originals)",
-                    ActionMode::Move => "Always Move (rename across dirs)",
-                })
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_label(matches!(self.action_mode, ActionMode::Auto), "Auto (D5)")
-                        .clicked()
-                    {
-                        self.action_mode = ActionMode::Auto;
-                        self.refresh_match_and_plan();
-                    }
-                    if ui
-                        .selectable_label(
-                            matches!(self.action_mode, ActionMode::Copy),
-                            "Always Copy (safe)",
-                        )
-                        .on_hover_text(
-                            "Subtitles are copied into the video folder; originals stay put.",
-                        )
-                        .clicked()
-                    {
-                        self.action_mode = ActionMode::Copy;
-                        self.refresh_match_and_plan();
-                    }
-                    if ui
-                        .selectable_label(
-                            matches!(self.action_mode, ActionMode::Move),
-                            "Always Move (destructive)",
-                        )
-                        .on_hover_text(
-                            "Subtitles are renamed across directories; the source file is removed.",
-                        )
-                        .clicked()
-                    {
-                        self.action_mode = ActionMode::Move;
-                        self.refresh_match_and_plan();
+            ui.label("Token → suffix map:");
+            let mut to_remove: Option<usize> = None;
+            for (i, (k, v)) in self.token_map_editor.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(k);
+                    ui.label("→");
+                    ui.text_edit_singleline(v);
+                    if ui.button("x").clicked() {
+                        to_remove = Some(i);
                     }
                 });
+            }
+            if let Some(i) = to_remove {
+                self.token_map_editor.remove(i);
+                self.refresh_match_and_plan();
+            }
+            if ui.button("+ add mapping").clicked() {
+                self.token_map_editor.push((String::new(), String::new()));
+            }
+            ui.horizontal(|ui| {
+                ui.label("Video regex (fallback):");
+                if ui.text_edit_singleline(&mut self.video_regex_input).changed() {
+                    self.refresh_match_and_plan();
+                }
+                ui.label("Subtitle regex:");
+                if ui.text_edit_singleline(&mut self.subtitle_regex_input).changed() {
+                    self.refresh_match_and_plan();
+                }
+            });
         });
+    }
 
+    // -----------------------------------------------------------------
+    // Modal windows
+    // -----------------------------------------------------------------
+
+    fn render_modals(&mut self, ctx: &egui::Context) {
         // Confirm dialog.
         if self.show_confirm {
             egui::Window::new("Confirm apply").collapsible(false).resizable(false).show(
-                ui.ctx(),
+                ctx,
                 |ui| {
                     if let Some(plan) = &self.plan {
                         let n = plan.ops.len();
@@ -842,7 +795,7 @@ impl eframe::App for App {
             egui::Window::new("History")
                 .resizable(true)
                 .default_size(egui::vec2(600.0, 400.0))
-                .show(ui.ctx(), |ui| {
+                .show(ctx, |ui| {
                     match self.history.list_sessions() {
                         Ok(sessions) => {
                             if sessions.is_empty() {
@@ -881,5 +834,151 @@ impl eframe::App for App {
                     }
                 });
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Module-level helpers
+// ---------------------------------------------------------------------------
+
+fn non_empty(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() { None } else { Some(t.to_string()) }
+}
+
+/// Render a file as its basename only. The directory is shown in the
+/// bottom status bar (per source side), not in every row.
+fn path_label(p: &FileEntry) -> String {
+    p.path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map_or_else(|| p.path.display().to_string(), std::string::ToString::to_string)
+}
+
+/// Distinct parent paths of an entry list, preserving first-seen order.
+fn unique_parents(entries: &[FileEntry]) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    entries
+        .iter()
+        .filter_map(|e| e.path.parent().map(Path::to_path_buf))
+        .filter(|p| seen.insert(p.clone()))
+        .collect()
+}
+
+/// Render a single line in the bottom status bar: full monospace path
+/// for one directory, or `N folders` with a hover listing all paths.
+fn render_side_dirs(ui: &mut egui::Ui, entries: &[FileEntry]) {
+    if entries.is_empty() {
+        ui.monospace("(none)");
+        return;
+    }
+    let parents = unique_parents(entries);
+    if parents.len() == 1 {
+        ui.monospace(parents[0].display().to_string());
+        return;
+    }
+    let tooltip = parents.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n");
+    ui.monospace(format!("{} folders", parents.len())).on_hover_text(tooltip);
+}
+
+fn preview_for_group(group: &PairGroup, plan: Option<&Plan>) -> String {
+    let Some(plan) = plan else {
+        return String::new();
+    };
+    let mut previews = Vec::new();
+    for op in &plan.ops {
+        let same_video = group
+            .video
+            .as_ref()
+            .is_some_and(|v| Some(&v.path) == op.video.as_ref().map(|o| &o.path));
+        let in_subs = group.subtitles.iter().any(|s| s.path == op.subtitle.path);
+        if same_video || in_subs {
+            previews.push(op.target_basename.clone());
+        }
+    }
+    if previews.is_empty() { "(no plan)".into() } else { previews.join(" | ") }
+}
+
+fn group_has_conflict(group: &PairGroup, plan: &Plan) -> bool {
+    plan.ops.iter().any(|o| {
+        let same_video = group
+            .video
+            .as_ref()
+            .is_some_and(|v| Some(&v.path) == o.video.as_ref().map(|vv| &vv.path));
+        let in_subs = group.subtitles.iter().any(|s| s.path == o.subtitle.path);
+        (same_video || in_subs) && !o.conflicts.is_empty()
+    })
+}
+
+#[allow(dead_code)]
+fn conflict_summary(c: &Conflict) -> &'static str {
+    match c {
+        Conflict::DuplicateTarget(_) => "duplicate",
+        Conflict::TargetExists(_) => "exists",
+        Conflict::ActionUnsupported(_) => "unsupported",
+    }
+}
+
+fn mv_script(plan: &Plan) -> String {
+    let mut out = String::from("#!/bin/sh\n# generated by subtitle-renamer\n");
+    for op in &plan.ops {
+        let cmd = match op.action {
+            PlannedAction::Rename => "mv",
+            PlannedAction::Copy => "cp",
+        };
+        let src = shell_quote(&op.subtitle.path.display().to_string());
+        let dst = shell_quote(&op.target_path.display().to_string());
+        let _ = writeln!(out, "{cmd} {src} {dst}");
+    }
+    out
+}
+
+fn shell_quote(s: &str) -> String {
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || "/-_=.,:@%+".contains(c)) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// eframe::App
+// ---------------------------------------------------------------------------
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Reset sidebar rects each frame; they're repopulated by
+        // `render_sidebar` below.
+        self.sidebar_video_rect = None;
+        self.sidebar_subtitle_rect = None;
+
+        // Left: sidebar with two source CollapsingHeaders (captures rects).
+        egui::Panel::left("source").resizable(true).min_size(220.0).max_size(320.0).show(
+            ui,
+            |ui| {
+                self.render_sidebar(ui);
+            },
+        );
+
+        // Drop router — sidebar rects are now populated.
+        self.process_drops(ui.ctx());
+
+        // Top toolbar.
+        egui::Panel::top("toolbar").show(ui, |ui| {
+            self.render_toolbar(ui);
+        });
+
+        // Bottom status bar (multi-line, full paths).
+        egui::Panel::bottom("status").show(ui, |ui| {
+            self.render_status_bar(ui);
+        });
+
+        // Central panel — history hint, settings, table, unmatched.
+        egui::CentralPanel::default().show(ui, |ui| {
+            self.render_central(ui);
+        });
+
+        // Modals live on ctx so they survive panel restructuring.
+        self.render_modals(ui.ctx());
     }
 }
