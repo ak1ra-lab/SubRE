@@ -24,6 +24,9 @@ pub struct UserConfig {
     pub subtitle_regex: Option<String>,
     #[serde(default)]
     pub action_mode: ActionMode,
+    /// Keep the window always on top.
+    #[serde(default)]
+    pub always_on_top: bool,
 }
 
 /// Returns the default config path: `dirs::config_dir()/subtitle-renamer/config.toml`.

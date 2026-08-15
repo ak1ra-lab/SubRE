@@ -28,7 +28,7 @@ use crate::core::execute::{
     rollback_unit, sha256_hex,
 };
 use crate::core::history::{HistoryDb, RenameRecord};
-use crate::core::matcher::{FileEntry, MatchResult, Matcher, PairGroup, collect_media_files};
+use crate::core::matcher::{FileEntry, MatchResult, Matcher, collect_media_files};
 use crate::core::parse::{ExtensionRegistry, FileCategory};
 use crate::core::plan::{
     ActionMode, Conflict, MappingScope, NamingConfig, Plan, PlannedAction, PlannedOp, StdFsProbe,
@@ -100,6 +100,9 @@ pub struct App {
     // preserve originals). Persisted in the config so it survives restart.
     pub action_mode: ActionMode,
 
+    /// Keep the window always on top. Persisted in the config.
+    pub always_on_top: bool,
+
     // History hint banner (checksum-based provenance).
     pub history_hint: Vec<RenameRecord>,
 
@@ -147,6 +150,7 @@ impl App {
             subtitle_regex_input: config.subtitle_regex.clone().unwrap_or_default(),
             registry,
             action_mode: config.action_mode,
+            always_on_top: config.always_on_top,
             config,
             history,
             video_entries: Vec::new(),
@@ -333,6 +337,7 @@ impl App {
         c.video_regex = non_empty(&self.video_regex_input);
         c.subtitle_regex = non_empty(&self.subtitle_regex_input);
         c.action_mode = self.action_mode;
+        c.always_on_top = self.always_on_top;
         c
     }
 
@@ -724,11 +729,30 @@ impl App {
 
         ui.separator();
 
-        // Three-column table.
-        let result = self.match_result.clone();
-        let plan = self.plan.clone();
+        // Three-column table, flattened to one row per subtitle (plus one row
+        // per unmatched video). Rows are precomputed so the body does not
+        // borrow `self.match_result` / `self.plan` during render.
+        let rows: Vec<(Option<FileEntry>, Option<FileEntry>, String, bool)> = {
+            let mut rows = Vec::new();
+            if let (Some(result), Some(plan)) = (&self.match_result, &self.plan) {
+                for op in &plan.ops {
+                    rows.push((
+                        op.video.clone(),
+                        Some(op.subtitle.clone()),
+                        op.target_basename.clone(),
+                        !op.conflicts.is_empty(),
+                    ));
+                }
+                for v in result.unmatched_videos() {
+                    rows.push((Some(v.clone()), None, String::new(), false));
+                }
+            }
+            rows
+        };
+
         TableBuilder::new(ui)
             .columns(egui_extras::Column::remainder().at_least(160.0), 3)
+            .striped(true)
             .header(20.0, |mut header| {
                 header.col(|ui| {
                     ui.strong("Video");
@@ -741,68 +765,61 @@ impl App {
                 });
             })
             .body(|mut body| {
-                if let Some(result) = &result {
-                    if result.groups.is_empty() {
-                        body.row(24.0, |mut row| {
-                            row.col(|ui| {
-                                ui.label("(no files yet)");
-                            });
-                            row.col(|_ui| {});
-                            row.col(|_ui| {});
-                        });
-                    }
-                    for group in &result.groups {
-                        let video_label =
-                            group.video.as_ref().map_or_else(|| "—".into(), path_label);
-                        let preview = preview_for_group(group, plan.as_ref());
-                        let conflict = plan.as_ref().is_some_and(|p| group_has_conflict(group, p));
-                        let group_video_unmatched = group.video.is_some()
-                            && group.subtitles.is_empty()
-                            && !preview.contains("(no plan)");
-                        body.row(24.0, |mut row| {
-                            row.col(|ui| {
-                                if group_video_unmatched {
-                                    ui.colored_label(egui::Color32::YELLOW, &video_label);
-                                } else {
-                                    ui.label(&video_label);
-                                }
-                            });
-                            row.col(|ui| {
-                                if group.subtitles.is_empty() {
-                                    ui.label("—");
-                                } else {
-                                    for sub in &group.subtitles {
-                                        ui.horizontal(|ui| {
-                                            ui.label(path_label(sub));
-                                            // Per-row "remove" button: drop
-                                            // this subtitle from the loaded
-                                            // set and refresh.
-                                            if ui.small_button("x").clicked() {
-                                                self.subtitle_entries
-                                                    .retain(|e| e.path != sub.path);
-                                                self.refresh_match_and_plan();
-                                            }
-                                        });
-                                    }
-                                }
-                            });
-                            row.col(|ui| {
-                                if conflict {
-                                    ui.colored_label(egui::Color32::RED, &preview);
-                                } else {
-                                    ui.label(&preview);
-                                }
-                            });
-                        });
-                    }
-                } else {
-                    body.row(24.0, |mut row| {
+                if rows.is_empty() {
+                    body.row(26.0, |mut row| {
                         row.col(|ui| {
                             ui.label("(no files yet)");
                         });
                         row.col(|_ui| {});
                         row.col(|_ui| {});
                     });
+                } else {
+                    let mut prev_video: Option<PathBuf> = None;
+                    for (video, subtitle, target, conflict) in &rows {
+                        body.row(26.0, |mut row| {
+                            row.col(|ui| {
+                                if let Some(v) = video {
+                                    if prev_video.as_ref() != Some(&v.path) {
+                                        prev_video = Some(v.path.clone());
+                                        if subtitle.is_none() {
+                                            ui.colored_label(egui::Color32::YELLOW, path_label(v));
+                                        } else {
+                                            ui.label(path_label(v));
+                                        }
+                                    }
+                                } else {
+                                    prev_video = None;
+                                    ui.label("—");
+                                }
+                            });
+                            row.col(|ui| {
+                                if let Some(sub) = subtitle {
+                                    ui.horizontal(|ui| {
+                                        ui.label(path_label(sub));
+                                        // Per-row "remove" button: drop this
+                                        // subtitle from the loaded set.
+                                        if ui.small_button("x").clicked() {
+                                            self.subtitle_entries.retain(|e| e.path != sub.path);
+                                            self.refresh_match_and_plan();
+                                        }
+                                    });
+                                } else {
+                                    ui.label("—");
+                                }
+                            });
+                            row.col(|ui| {
+                                if subtitle.is_some() {
+                                    if *conflict {
+                                        ui.colored_label(egui::Color32::RED, target);
+                                    } else {
+                                        ui.label(target);
+                                    }
+                                } else {
+                                    ui.label("—");
+                                }
+                            });
+                        });
+                    }
                 }
             });
 
@@ -849,6 +866,14 @@ impl App {
                 }
                 if ui.checkbox(&mut self.case_sensitive_toggle, "Case-sensitive").changed() {
                     self.refresh_match_and_plan();
+                }
+                if ui.checkbox(&mut self.always_on_top, "Always on top").changed() {
+                    let level = if self.always_on_top {
+                        egui::WindowLevel::AlwaysOnTop
+                    } else {
+                        egui::WindowLevel::Normal
+                    };
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
                 }
                 if ui.button("Save config").clicked() {
                     self.save_config();
@@ -1161,35 +1186,6 @@ fn unique_parents(entries: &[FileEntry]) -> Vec<PathBuf> {
         .filter_map(|e| e.path.parent().map(Path::to_path_buf))
         .filter(|p| seen.insert(p.clone()))
         .collect()
-}
-
-fn preview_for_group(group: &PairGroup, plan: Option<&Plan>) -> String {
-    let Some(plan) = plan else {
-        return String::new();
-    };
-    let mut previews = Vec::new();
-    for op in &plan.ops {
-        let same_video = group
-            .video
-            .as_ref()
-            .is_some_and(|v| Some(&v.path) == op.video.as_ref().map(|o| &o.path));
-        let in_subs = group.subtitles.iter().any(|s| s.path == op.subtitle.path);
-        if same_video || in_subs {
-            previews.push(op.target_basename.clone());
-        }
-    }
-    if previews.is_empty() { "(no plan)".into() } else { previews.join(" | ") }
-}
-
-fn group_has_conflict(group: &PairGroup, plan: &Plan) -> bool {
-    plan.ops.iter().any(|o| {
-        let same_video = group
-            .video
-            .as_ref()
-            .is_some_and(|v| Some(&v.path) == o.video.as_ref().map(|vv| &vv.path));
-        let in_subs = group.subtitles.iter().any(|s| s.path == o.subtitle.path);
-        (same_video || in_subs) && !o.conflicts.is_empty()
-    })
 }
 
 #[allow(dead_code)]
