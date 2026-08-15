@@ -749,22 +749,61 @@ fn strip_leading_zeros(s: &str) -> &str {
 }
 
 // ---------------------------------------------------------------------------
-// Language token extraction (used by plan.rs for default suffix resolution)
+// Language-token alias detection (used by plan.rs for `${lang}` resolution)
 // ---------------------------------------------------------------------------
 
-/// Built-in table of language/group tokens matched on the stem.
-pub const LANGUAGE_TOKENS: &[&str] = &[
-    "chs", "cht", "sc", "tc", "jp", "jpn", "eng", "en", "gb", "tw", "简体", "繁體", "简", "繁",
-    "jpsc", "jptc",
+/// Built-in `token -> canonical language` alias table. Matching is
+/// boundary-based and longest-first, so `jptc` is not misdetected as `jp`.
+pub const LANGUAGE_ALIASES: &[(&str, &str)] = &[
+    ("chs", "zh-Hans"),
+    ("sc", "zh-Hans"),
+    ("简体", "zh-Hans"),
+    ("简", "zh-Hans"),
+    ("gb", "zh-Hans"),
+    ("cht", "zh-Hant"),
+    ("tc", "zh-Hant"),
+    ("繁體", "zh-Hant"),
+    ("繁", "zh-Hant"),
+    ("tw", "zh-Hant"),
+    ("jpn", "jp"),
+    ("jp", "jp"),
+    ("eng", "eng"),
+    ("en", "eng"),
 ];
 
-/// If the stem contains a recognized language token, return it (lower-cased).
-pub fn detect_language_token(stem: &str) -> Option<String> {
-    let lower = stem.to_ascii_lowercase();
-    for token in LANGUAGE_TOKENS {
-        let token_lower = token.to_ascii_lowercase();
-        if lower.contains(&token_lower) {
-            return Some(token_lower);
+/// Return the earliest byte offset of `token` in `stem` where the match is
+/// bounded on both sides by a non-alphanumeric character (or the string
+/// start/end). `case_sensitive` controls whether the comparison folds case.
+pub fn find_boundary_token(stem: &str, token: &str, case_sensitive: bool) -> Option<usize> {
+    if token.is_empty() {
+        return None;
+    }
+    let (hay, needle): (Cow<'_, str>, Cow<'_, str>) = if case_sensitive {
+        (Cow::Borrowed(stem), Cow::Borrowed(token))
+    } else {
+        (Cow::Owned(stem.to_lowercase()), Cow::Owned(token.to_lowercase()))
+    };
+    let mut start = 0;
+    while let Some(rel) = hay[start..].find(needle.as_ref()) {
+        let abs = start + rel;
+        let end = abs + needle.len();
+        let left_boundary = hay[..abs].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+        let right_boundary = hay[end..].chars().next().is_none_or(|c| !c.is_alphanumeric());
+        if left_boundary && right_boundary {
+            return Some(abs);
+        }
+        start = abs + needle.len();
+    }
+    None
+}
+
+/// Resolve the longest-matching built-in language alias for `stem`, if any.
+pub fn detect_language_alias(stem: &str, case_sensitive: bool) -> Option<String> {
+    let mut aliases: Vec<&(&str, &str)> = LANGUAGE_ALIASES.iter().collect();
+    aliases.sort_by_key(|(token, _)| std::cmp::Reverse(token.chars().count()));
+    for (token, canonical) in aliases {
+        if find_boundary_token(stem, token, case_sensitive).is_some() {
+            return Some((*canonical).to_string());
         }
     }
     None
@@ -1225,10 +1264,23 @@ mod tests {
     }
 
     #[test]
-    fn language_token_detection() {
-        assert_eq!(detect_language_token("Show.S01E01.chs.ass"), Some("chs".into()));
-        assert_eq!(detect_language_token("Show.S01E01.cht"), Some("cht".into()));
-        assert_eq!(detect_language_token("No.Lang.Here"), None);
+    fn language_alias_detection() {
+        assert_eq!(detect_language_alias("Show.S01E01.chs.ass", false), Some("zh-Hans".into()));
+        assert_eq!(detect_language_alias("Show.S01E01.cht", false), Some("zh-Hant".into()));
+        assert_eq!(detect_language_alias("No.Lang.Here", false), None);
+        assert_eq!(detect_language_alias("Show.S01E01.简体.ass", false), Some("zh-Hans".into()));
+    }
+
+    #[test]
+    fn find_boundary_token_requires_boundaries() {
+        assert_eq!(find_boundary_token("_track3.ass", "track3", false), Some(1));
+        assert_eq!(find_boundary_token("jptc", "jp", false), None);
+        assert_eq!(find_boundary_token("jp_gb_big5", "jp", false), Some(0));
+        assert_eq!(find_boundary_token("x264", "x", false), None);
+        assert_eq!(find_boundary_token("[X2&CASO]", "X2&CASO", false), Some(1));
+        // Case sensitivity.
+        assert_eq!(find_boundary_token("CHS", "chs", false), Some(0));
+        assert_eq!(find_boundary_token("CHS", "chs", true), None);
     }
 
     #[test]

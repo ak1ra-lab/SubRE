@@ -22,6 +22,8 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
+use crate::core::plan::{MappingScope, TokenMapping};
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,6 +43,14 @@ CREATE TABLE IF NOT EXISTS renames (
 );
 CREATE INDEX IF NOT EXISTS idx_renames_identity ON renames(dir, checksum, at);
 CREATE INDEX IF NOT EXISTS idx_renames_session ON renames(session_id);
+CREATE TABLE IF NOT EXISTS token_mappings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token TEXT NOT NULL,
+    value TEXT NOT NULL,
+    var TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
 ";
 
 /// Schema version. Older databases (version < `CURRENT_VERSION`) predate
@@ -67,12 +77,9 @@ pub struct RenameRecord {
     pub at: i64,
 }
 
-/// Default database location: `dirs::data_dir()/subtitle-renamer/history.db`.
+/// Default database location: `dirs::data_dir()/subtitle-renamer/app.db`.
 pub fn default_db_path() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("subtitle-renamer")
-        .join("history.db")
+    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("subtitle-renamer").join("app.db")
 }
 
 #[derive(Debug)]
@@ -210,6 +217,38 @@ impl HistoryDb {
         )?;
         let rows = stmt
             .query_map(params![dir.display().to_string(), checksum], row_to_rename)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Replace all session-scoped token mappings with `mappings`.
+    pub fn replace_session_mappings(&self, mappings: &[TokenMapping]) -> Result<()> {
+        self.conn.execute("DELETE FROM token_mappings WHERE scope = 'session'", [])?;
+        let at = now_epoch();
+        for m in mappings {
+            self.conn.execute(
+                "INSERT INTO token_mappings (token, value, var, scope, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![m.token, m.value, m.var, "session", at],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// All session-scoped token mappings persisted in the db, oldest first.
+    pub fn session_mappings(&self) -> Result<Vec<TokenMapping>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT token, value, var FROM token_mappings WHERE scope = 'session' ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(TokenMapping {
+                    token: row.get(0)?,
+                    value: row.get(1)?,
+                    var: row.get(2)?,
+                    scope: MappingScope::Session,
+                })
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }

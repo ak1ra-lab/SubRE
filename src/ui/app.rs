@@ -31,7 +31,8 @@ use crate::core::history::{HistoryDb, RenameRecord};
 use crate::core::matcher::{FileEntry, MatchResult, Matcher, PairGroup, collect_media_files};
 use crate::core::parse::{ExtensionRegistry, FileCategory};
 use crate::core::plan::{
-    ActionMode, Conflict, Plan, PlannedAction, PlannedOp, StdFsProbe, SuffixConfig, generate_plan,
+    ActionMode, Conflict, MappingScope, NamingConfig, Plan, PlannedAction, PlannedOp, StdFsProbe,
+    TokenMapping, generate_plan,
 };
 
 /// Which side a path should be ingested onto when the user explicitly
@@ -48,7 +49,7 @@ struct RefreshRequest {
     subtitles: Vec<FileEntry>,
     video_regex: Option<String>,
     subtitle_regex: Option<String>,
-    suffix: SuffixConfig,
+    naming: NamingConfig,
     action_mode: ActionMode,
     epoch: u64,
 }
@@ -79,9 +80,10 @@ pub struct App {
     pub status_message: String,
 
     // Editable UI fields.
-    pub global_suffix_input: String,
-    pub auto_extract_toggle: bool,
-    pub token_map_editor: Vec<(String, String)>,
+    pub template_input: String,
+    pub auto_fill_lang_toggle: bool,
+    pub case_sensitive_toggle: bool,
+    pub mapping_editor: Vec<TokenMapping>,
     pub video_regex_input: String,
     pub subtitle_regex_input: String,
 
@@ -123,6 +125,11 @@ pub struct App {
 
 impl App {
     pub fn new(config: UserConfig, history: HistoryDb) -> Self {
+        let mut config = config;
+        // Merge session-scoped mappings persisted in the db into the config.
+        if let Ok(session) = history.session_mappings() {
+            config.suffix.mappings.extend(session);
+        }
         let mut registry = ExtensionRegistry::new();
         for ext in &config.custom_video_exts {
             registry.add_custom_video(ext);
@@ -132,14 +139,10 @@ impl App {
         }
         let (refresh_tx, refresh_rx) = spawn_refresh_worker();
         Self {
-            global_suffix_input: config.suffix.global.clone(),
-            auto_extract_toggle: config.suffix.auto_extract_language_token,
-            token_map_editor: config
-                .suffix
-                .token_map
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
+            template_input: config.suffix.template.clone(),
+            auto_fill_lang_toggle: config.suffix.auto_fill_lang,
+            case_sensitive_toggle: config.suffix.case_sensitive,
+            mapping_editor: config.suffix.mappings.clone(),
             video_regex_input: config.video_regex.clone().unwrap_or_default(),
             subtitle_regex_input: config.subtitle_regex.clone().unwrap_or_default(),
             registry,
@@ -239,7 +242,7 @@ impl App {
             subtitles: self.subtitle_entries.clone(),
             video_regex: non_empty(&self.video_regex_input),
             subtitle_regex: non_empty(&self.subtitle_regex_input),
-            suffix: self.current_suffix_config(),
+            naming: self.current_naming_config(),
             action_mode: self.action_mode,
             epoch: self.refresh_epoch,
         };
@@ -308,23 +311,23 @@ impl App {
         }
     }
 
-    fn current_suffix_config(&self) -> SuffixConfig {
-        let mut token_map = HashMap::new();
-        for (k, v) in &self.token_map_editor {
-            if !k.is_empty() && !v.is_empty() {
-                token_map.insert(k.clone(), v.clone());
-            }
-        }
-        SuffixConfig {
-            global: self.global_suffix_input.clone(),
-            token_map,
-            auto_extract_language_token: self.auto_extract_toggle,
+    fn current_naming_config(&self) -> NamingConfig {
+        NamingConfig {
+            template: self.template_input.clone(),
+            auto_fill_lang: self.auto_fill_lang_toggle,
+            case_sensitive: self.case_sensitive_toggle,
+            mappings: self
+                .mapping_editor
+                .iter()
+                .filter(|m| !m.token.is_empty() && !m.value.is_empty() && !m.var.is_empty())
+                .cloned()
+                .collect(),
         }
     }
 
     fn current_config(&self) -> UserConfig {
         let mut c = self.config.clone();
-        c.suffix = self.current_suffix_config();
+        c.suffix = self.current_naming_config();
         c.custom_video_exts = self.registry.custom_video().iter().cloned().collect();
         c.custom_subtitle_exts = self.registry.custom_subtitle().iter().cloned().collect();
         c.video_regex = non_empty(&self.video_regex_input);
@@ -831,52 +834,82 @@ impl App {
         // "Unmatched / unknown" section below.
         egui::CollapsingHeader::new("⚙ Settings ▾").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Global suffix:");
-                if ui.text_edit_singleline(&mut self.global_suffix_input).changed() {
-                    self.refresh_match_and_plan();
-                }
+                ui.label("Template:");
                 if ui
-                    .checkbox(&mut self.auto_extract_toggle, "Auto-detect language token")
+                    .add(
+                        egui::TextEdit::singleline(&mut self.template_input)
+                            .hint_text("${video}.${ext}"),
+                    )
                     .changed()
                 {
                     self.refresh_match_and_plan();
                 }
-                if ui.button("Save config").clicked() {
-                    let cfg = self.current_config();
-                    if let Err(e) = ConfigStore::save_default(&cfg) {
-                        self.status_message = format!("config save failed: {e}");
-                    } else {
-                        self.config = cfg;
-                    }
+                if ui.checkbox(&mut self.auto_fill_lang_toggle, "Auto-fill lang").changed() {
                     self.refresh_match_and_plan();
                 }
+                if ui.checkbox(&mut self.case_sensitive_toggle, "Case-sensitive").changed() {
+                    self.refresh_match_and_plan();
+                }
+                if ui.button("Save config").clicked() {
+                    self.save_config();
+                }
             });
-            ui.label("Token → suffix map:");
+            ui.label("Token → variable mappings:");
             let mut to_remove: Option<usize> = None;
             let mut edited = false;
-            for (i, (k, v)) in self.token_map_editor.iter_mut().enumerate() {
+            for (i, m) in self.mapping_editor.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
-                    if ui.text_edit_singleline(k).changed() {
+                    if ui.text_edit_singleline(&mut m.token).changed() {
                         edited = true;
                     }
                     ui.label("→");
-                    if ui.text_edit_singleline(v).changed() {
+                    if ui.text_edit_singleline(&mut m.value).changed() {
                         edited = true;
                     }
+                    ui.label("var:");
+                    if ui.text_edit_singleline(&mut m.var).changed() {
+                        edited = true;
+                    }
+                    egui::ComboBox::from_id_salt(("scope", i))
+                        .selected_text(match m.scope {
+                            MappingScope::Global => "global",
+                            MappingScope::Session => "session",
+                        })
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(m.scope == MappingScope::Global, "global")
+                                .clicked()
+                            {
+                                m.scope = MappingScope::Global;
+                                edited = true;
+                            }
+                            if ui
+                                .selectable_label(m.scope == MappingScope::Session, "session")
+                                .clicked()
+                            {
+                                m.scope = MappingScope::Session;
+                                edited = true;
+                            }
+                        });
                     if ui.button("x").clicked() {
                         to_remove = Some(i);
                     }
                 });
             }
             if let Some(i) = to_remove {
-                self.token_map_editor.remove(i);
+                self.mapping_editor.remove(i);
                 self.refresh_match_and_plan();
             }
             if edited {
                 self.refresh_match_and_plan();
             }
             if ui.button("+ add mapping").clicked() {
-                self.token_map_editor.push((String::new(), String::new()));
+                self.mapping_editor.push(TokenMapping {
+                    token: String::new(),
+                    value: String::new(),
+                    var: "lang".into(),
+                    scope: MappingScope::Global,
+                });
                 self.refresh_match_and_plan();
             }
             ui.horizontal(|ui| {
@@ -890,6 +923,23 @@ impl App {
                 }
             });
         });
+    }
+
+    fn save_config(&mut self) {
+        let cfg = self.current_config();
+        // Global mappings -> TOML; session mappings -> SQLite.
+        let (global, session): (Vec<TokenMapping>, Vec<TokenMapping>) =
+            cfg.suffix.mappings.iter().cloned().partition(|m| m.scope == MappingScope::Global);
+        let mut toml_cfg = cfg.clone();
+        toml_cfg.suffix.mappings = global;
+        match ConfigStore::save_default(&toml_cfg) {
+            Ok(()) => self.config = cfg,
+            Err(e) => self.status_message = format!("config save failed: {e}"),
+        }
+        if let Err(e) = self.history.replace_session_mappings(&session) {
+            self.status_message = format!("session mappings save failed: {e}");
+        }
+        self.refresh_match_and_plan();
     }
 
     // -----------------------------------------------------------------
@@ -1017,7 +1067,7 @@ fn spawn_refresh_worker() -> (mpsc::Sender<RefreshRequest>, mpsc::Receiver<Refre
                 req.video_regex.as_deref(),
                 req.subtitle_regex.as_deref(),
             );
-            let plan = generate_plan(&result, &req.suffix, &StdFsProbe, req.action_mode);
+            let plan = generate_plan(&result, &req.naming, &StdFsProbe, req.action_mode);
             let mut identities = Vec::new();
             for sub in &req.subtitles {
                 if let Some(dir) = sub.path.parent()

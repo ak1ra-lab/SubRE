@@ -203,7 +203,7 @@ pub fn rollback_unit(items: &[RollbackItem]) -> RollbackOutcome {
 mod tests {
     use super::*;
     use crate::core::matcher::Matcher;
-    use crate::core::plan::{SuffixConfig, generate_plan};
+    use crate::core::plan::{NamingConfig, generate_plan};
 
     struct NoExists;
     impl crate::core::plan::FsProbe for NoExists {
@@ -246,7 +246,7 @@ mod tests {
         let r = m.match_files(&v, &s, None, None);
         let plan = generate_plan(
             &r,
-            &SuffixConfig::default(),
+            &NamingConfig::default(),
             &NoExists,
             crate::core::plan::ActionMode::Auto,
         );
@@ -274,7 +274,7 @@ mod tests {
         let r = m.match_files(&v, &s, None, None);
         let plan = generate_plan(
             &r,
-            &SuffixConfig::default(),
+            &NamingConfig::default(),
             &NoExists,
             crate::core::plan::ActionMode::Auto,
         );

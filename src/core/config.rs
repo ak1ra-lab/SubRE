@@ -1,20 +1,19 @@
 //! User configuration persistence (TOML under the XDG config dir).
 //!
-//! Fields mirror the parts of [`crate::core::plan::SuffixConfig`] plus
+//! Fields mirror the parts of [`crate::core::plan::NamingConfig`] plus
 //! user-custom extension overrides. Loaded on startup, saved on demand.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::plan::{ActionMode, SuffixConfig};
+use super::plan::{ActionMode, NamingConfig};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserConfig {
     #[serde(default)]
-    pub suffix: SuffixConfig,
+    pub suffix: NamingConfig,
     #[serde(default)]
     pub custom_video_exts: Vec<String>,
     #[serde(default)]
@@ -25,12 +24,6 @@ pub struct UserConfig {
     pub subtitle_regex: Option<String>,
     #[serde(default)]
     pub action_mode: ActionMode,
-}
-
-impl UserConfig {
-    pub fn token_map(&self) -> &HashMap<String, String> {
-        &self.suffix.token_map
-    }
 }
 
 /// Returns the default config path: `dirs::config_dir()/subtitle-renamer/config.toml`.
@@ -78,6 +71,7 @@ impl ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::plan::{MappingScope, TokenMapping};
 
     #[test]
     fn round_trip_toml() {
@@ -86,12 +80,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         let mut cfg = UserConfig::default();
-        cfg.suffix.global = "zh-Hans".into();
-        cfg.suffix.token_map.insert("chs".into(), "zh-Hans".into());
+        cfg.suffix.template = "${video}.${lang}.${ext}".into();
+        cfg.suffix.mappings.push(TokenMapping {
+            token: "chs".into(),
+            value: "zh-Hans".into(),
+            var: "lang".into(),
+            scope: MappingScope::Global,
+        });
         cfg.custom_subtitle_exts = vec!["sup".into()];
         ConfigStore::save(&cfg, &path).unwrap();
         let loaded = ConfigStore::load(&path).unwrap();
-        assert_eq!(loaded.suffix.global, "zh-Hans");
+        assert_eq!(loaded.suffix.template, "${video}.${lang}.${ext}");
+        assert_eq!(loaded.suffix.mappings.len(), 1);
+        assert_eq!(loaded.suffix.mappings[0].token, "chs");
         assert_eq!(loaded.custom_subtitle_exts, vec!["sup".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -100,7 +101,8 @@ mod tests {
     fn missing_file_returns_default() {
         let path = Path::new("/nonexistent/path/config.toml");
         let cfg = ConfigStore::load(path).unwrap();
-        assert_eq!(cfg.suffix.global, "");
+        assert_eq!(cfg.suffix.template, "");
+        assert!(cfg.suffix.mappings.is_empty());
     }
 
     #[test]

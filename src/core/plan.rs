@@ -1,7 +1,7 @@
 //! Rename-plan generation.
 //!
 //! `generate_plan` is a pure function: given a [`MatchResult`] and a
-//! [`SuffixConfig`], it produces a [`Plan`] — a list of [`PlannedOp`]s with
+//! [`NamingConfig`], it produces a [`Plan`] — a list of [`PlannedOp`]s with
 //! each op tagged with any [`Conflict`]s. A "filesystem probe" trait lets the
 //! caller (production code or tests) plug in a cheap existence check for
 //! the target path, used to flag conflicts when the target file already
@@ -13,49 +13,149 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::matcher::{FileEntry, MatchResult};
-use super::parse::detect_language_token;
+use super::parse::{detect_language_alias, find_boundary_token};
 
-/// What suffix to apply to a subtitle when building its target filename.
-///
-/// Resolution order (per design D4):
-///   1. Token mapping table (`token_map`).
-///   2. Auto-detected language token from the stem (only if
-///      `auto_extract_language_token` is enabled — default OFF).
-///   3. Global suffix string.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SuffixConfig {
-    /// Global suffix appended between the video main-name and the subtitle
-    /// extension. May be empty.
-    pub global: String,
-    /// Map from detected language token (lower-case) to canonical suffix
-    /// (without the leading dot, e.g. "zh-Hans").
-    pub token_map: HashMap<String, String>,
-    /// When true, an unconfigured language token in the subtitle stem is
-    /// used as the default suffix. Default is false so that the "no
-    /// suffix configured" plan stays clean.
-    #[serde(default)]
-    pub auto_extract_language_token: bool,
+/// Persistence scope of a token mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MappingScope {
+    /// Persisted in the TOML config; applies across sessions.
+    #[default]
+    Global,
+    /// Persisted in the `SQLite` db; applies to the current batch only.
+    Session,
 }
 
-impl SuffixConfig {
-    /// Resolve the effective suffix for `subtitle`.
-    pub fn resolve_for(&self, subtitle: &FileEntry) -> String {
-        // 1. Mapping table (look up the auto-detected token, if any).
-        if let Some(tok) = detect_language_token(&subtitle.stem)
-            && let Some(mapped) = self.token_map.get(&tok)
-        {
-            return format!(".{}", mapped.trim_start_matches('.'));
-        }
-        // 2. Language token auto-extraction (opt-in).
-        if self.auto_extract_language_token
-            && let Some(tok) = detect_language_token(&subtitle.stem)
-        {
-            return format!(".{tok}");
-        }
-        // 3. Global suffix.
-        let g = self.global.trim();
-        if g.is_empty() { String::new() } else { format!(".{}", g.trim_start_matches('.')) }
+/// A single "token -> (value, target variable)" mapping.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenMapping {
+    pub token: String,
+    pub value: String,
+    /// Template variable this mapping fills; defaults to `lang`.
+    #[serde(default = "default_var")]
+    pub var: String,
+    #[serde(default)]
+    pub scope: MappingScope,
+}
+
+fn default_var() -> String {
+    "lang".to_string()
+}
+
+/// Naming configuration: a target-filename template plus token mappings that
+/// fill `${...}` template variables. Replaces the former `SuffixConfig`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NamingConfig {
+    /// Target-filename template. Empty means the default `${video}.${ext}`.
+    #[serde(default)]
+    pub template: String,
+    /// Fill `${lang}` from built-in aliases when no explicit mapping does.
+    #[serde(default)]
+    pub auto_fill_lang: bool,
+    /// Case-sensitive token matching (default: case-insensitive).
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default, rename = "mapping")]
+    pub mappings: Vec<TokenMapping>,
+}
+
+/// Default template: video main-name + subtitle extension.
+pub const DEFAULT_TEMPLATE: &str = "${video}.${ext}";
+
+impl NamingConfig {
+    /// The template actually used, falling back to [`DEFAULT_TEMPLATE`].
+    pub fn effective_template(&self) -> &str {
+        if self.template.trim().is_empty() { DEFAULT_TEMPLATE } else { self.template.trim() }
     }
+
+    /// Resolve template variables for `subtitle` into a `var -> value` map.
+    ///
+    /// Explicit mappings are matched with boundary + longest-token-first;
+    /// among mappings sharing a var, the longest token wins (ties broken by
+    /// earliest occurrence). If `${lang}` is still unset and `auto_fill_lang`
+    /// is on, built-in aliases provide a fallback.
+    pub fn resolve_vars(&self, subtitle: &FileEntry) -> HashMap<String, String> {
+        let stem = &subtitle.stem;
+        let mut vars: HashMap<String, String> = HashMap::new();
+
+        // Track the best (value, token_len, first_pos) per var across all
+        // explicit mappings that match the stem.
+        let mut best: HashMap<&str, (&str, usize, usize)> = HashMap::new();
+        for m in &self.mappings {
+            if m.token.is_empty() || m.value.is_empty() || m.var.is_empty() {
+                continue;
+            }
+            let Some(pos) = find_boundary_token(stem, &m.token, self.case_sensitive) else {
+                continue;
+            };
+            let len = m.token.chars().count();
+            let replace = match best.get(m.var.as_str()) {
+                None => true,
+                Some(&(_, blen, bpos)) => len > blen || (len == blen && pos < bpos),
+            };
+            if replace {
+                best.insert(m.var.as_str(), (m.value.as_str(), len, pos));
+            }
+        }
+        for (var, (value, _, _)) in best {
+            vars.insert(var.to_string(), value.to_string());
+        }
+
+        if !vars.contains_key("lang")
+            && self.auto_fill_lang
+            && let Some(lang) = detect_language_alias(stem, self.case_sensitive)
+        {
+            vars.insert("lang".to_string(), lang);
+        }
+
+        vars
+    }
+}
+
+/// Render `template`, substituting `${video}` / `${ext}` and any `${var}`
+/// present in `vars`. An empty variable collapses the preceding run of
+/// separator characters (`.`, `-`, `_`), and leading/trailing separators are
+/// trimmed, so an empty variable never leaves a dangling separator.
+pub fn render_template<S: std::hash::BuildHasher>(
+    template: &str,
+    vars: &HashMap<String, String, S>,
+    video_stem: &str,
+    ext: &str,
+) -> String {
+    fn is_sep(c: char) -> bool {
+        matches!(c, '.' | '-' | '_')
+    }
+
+    let chars: Vec<char> = template.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1] == '{' {
+            let Some(close) = (i + 2..chars.len()).find(|&j| chars[j] == '}') else {
+                out.push(chars[i]);
+                i += 1;
+                continue;
+            };
+            let name: String = chars[i + 2..close].iter().collect();
+            let value: Option<&str> = match name.as_str() {
+                "video" => Some(video_stem),
+                "ext" => Some(ext),
+                other => vars.get(other).map(String::as_str),
+            };
+            match value {
+                Some(v) if !v.is_empty() => out.push_str(v),
+                _ => {
+                    while out.chars().next_back().is_some_and(is_sep) {
+                        out.pop();
+                    }
+                }
+            }
+            i = close + 1;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out.trim_matches(|c: char| is_sep(c)).to_string()
 }
 
 /// One planned filesystem operation.
@@ -176,7 +276,7 @@ impl FsProbe for StdFsProbe {
     }
 }
 
-/// Generate a plan for `result` using `suffix`, `probe`, and the user's
+/// Generate a plan for `result` using `naming`, `probe`, and the user's
 /// `action_mode`.
 ///
 /// The plan is pure with respect to filesystem state EXCEPT for the
@@ -185,7 +285,7 @@ impl FsProbe for StdFsProbe {
 /// pure.
 pub fn generate_plan(
     result: &MatchResult,
-    suffix: &SuffixConfig,
+    naming: &NamingConfig,
     probe: &dyn FsProbe,
     action_mode: ActionMode,
 ) -> Plan {
@@ -223,15 +323,11 @@ pub fn generate_plan(
             // The "main" extension is the longest / canonical one (per
             // design: idx is the index, sub is the data — main = idx).
             // But for target naming we keep each member's own extension and
-            // share the suffix + main-name.
+            // share the template-derived main-name.
             for sub in members {
-                let effective_suffix = suffix.resolve_for(sub);
-                let main_name = if effective_suffix.is_empty() {
-                    video_main.clone()
-                } else {
-                    format!("{video_main}{effective_suffix}")
-                };
-                let target_basename = format!("{}.{}", main_name, sub.ext);
+                let vars = naming.resolve_vars(sub);
+                let target_basename =
+                    render_template(naming.effective_template(), &vars, &video_main, &sub.ext);
                 let target_dir = video.as_ref().and_then(|v| v.path.parent()).map_or_else(
                     || sub.path.parent().map(std::path::Path::to_path_buf).unwrap_or_default(),
                     std::path::Path::to_path_buf,
@@ -328,7 +424,7 @@ mod tests {
         let v = vec![entry("/videos/[Group] Show - 01 [1080p].mkv")];
         let s = vec![entry("/subs/Show.S01E01.chs.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &SuffixConfig::default(), &NoExists, ActionMode::Auto);
+        let plan = generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Auto);
         assert_eq!(plan.ops.len(), 1);
         let op = &plan.ops[0];
         assert_eq!(op.target_basename, "[Group] Show - 01 [1080p].ass");
@@ -337,41 +433,88 @@ mod tests {
     }
 
     #[test]
-    fn global_suffix_applied() {
+    fn template_with_literal_suffix() {
         let m = Matcher::new();
         let v = vec![entry("/videos/Show - 01.mkv")];
         let s = vec![entry("/subs/Show.S01E01.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let cfg = SuffixConfig {
-            global: "zh-Hans".into(),
-            token_map: HashMap::new(),
-            auto_extract_language_token: false,
+        let cfg =
+            NamingConfig { template: "${video}.zh-Hans.${ext}".into(), ..NamingConfig::default() };
+        let plan = generate_plan(&r, &cfg, &NoExists, ActionMode::Auto);
+        assert_eq!(plan.ops[0].target_basename, "Show - 01.zh-Hans.ass");
+    }
+
+    #[test]
+    fn language_alias_fills_lang_var() {
+        let m = Matcher::new();
+        let v = vec![entry("/videos/Show - 01.mkv")];
+        let s = vec![entry("/subs/Show.S01E01.cht.ass")];
+        let r = m.match_files(&v, &s, None, None);
+        let cfg = NamingConfig {
+            template: "${video}.${lang}.${ext}".into(),
+            auto_fill_lang: true,
+            ..NamingConfig::default()
+        };
+        let plan = generate_plan(&r, &cfg, &NoExists, ActionMode::Auto);
+        assert_eq!(plan.ops[0].target_basename, "Show - 01.zh-Hant.ass");
+    }
+
+    #[test]
+    fn token_mapping_fills_lang_var() {
+        let m = Matcher::new();
+        let v = vec![entry("/videos/Show - 01.mkv")];
+        let s = vec![entry("/subs/Show.S01E01.chs.ass")];
+        let r = m.match_files(&v, &s, None, None);
+        let cfg = NamingConfig {
+            template: "${video}.${lang}.${ext}".into(),
+            mappings: vec![TokenMapping {
+                token: "chs".into(),
+                value: "zh-Hans".into(),
+                var: "lang".into(),
+                scope: MappingScope::Global,
+            }],
+            ..NamingConfig::default()
         };
         let plan = generate_plan(&r, &cfg, &NoExists, ActionMode::Auto);
         assert_eq!(plan.ops[0].target_basename, "Show - 01.zh-Hans.ass");
     }
 
     #[test]
-    fn language_token_auto_extracted() {
+    fn explicit_mapping_overrides_alias() {
         let m = Matcher::new();
         let v = vec![entry("/videos/Show - 01.mkv")];
-        let s = vec![entry("/subs/Show.S01E01.cht.ass")];
+        // `_track3` is explicit -> zh-Hans; `chs` alias also present but
+        // explicit wins for the same var.
+        let s = vec![entry("/subs/Show.S01E01.chs_track3.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let cfg = SuffixConfig { auto_extract_language_token: true, ..SuffixConfig::default() };
+        let cfg = NamingConfig {
+            template: "${video}.${lang}.${ext}".into(),
+            auto_fill_lang: true,
+            mappings: vec![TokenMapping {
+                token: "track3".into(),
+                value: "zh-Hans".into(),
+                var: "lang".into(),
+                scope: MappingScope::Global,
+            }],
+            ..NamingConfig::default()
+        };
         let plan = generate_plan(&r, &cfg, &NoExists, ActionMode::Auto);
-        assert_eq!(plan.ops[0].target_basename, "Show - 01.cht.ass");
+        assert_eq!(plan.ops[0].target_basename, "Show - 01.zh-Hans.ass");
     }
 
     #[test]
-    fn token_mapping_overrides_auto() {
+    fn empty_var_collapses_separator() {
         let m = Matcher::new();
         let v = vec![entry("/videos/Show - 01.mkv")];
-        let s = vec![entry("/subs/Show.S01E01.chs.ass")];
+        let s = vec![entry("/subs/Show.S01E01.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let mut cfg = SuffixConfig::default();
-        cfg.token_map.insert("chs".into(), "zh-Hans".into());
+        // No group / lang mappings, so `${group}` and `${lang}` are empty.
+        let cfg = NamingConfig {
+            template: "${video}.${group}-${lang}.${ext}".into(),
+            ..NamingConfig::default()
+        };
         let plan = generate_plan(&r, &cfg, &NoExists, ActionMode::Auto);
-        assert_eq!(plan.ops[0].target_basename, "Show - 01.zh-Hans.ass");
+        assert_eq!(plan.ops[0].target_basename, "Show - 01.ass");
     }
 
     #[test]
@@ -380,7 +523,7 @@ mod tests {
         let v = vec![entry("/videos/Show - 01.mkv")];
         let s = vec![entry("/subs/Show.S01E01.idx"), entry("/subs/Show.S01E01.sub")];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &SuffixConfig::default(), &NoExists, ActionMode::Auto);
+        let plan = generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Auto);
         assert_eq!(plan.ops.len(), 2);
         let basenames: Vec<&str> = plan.ops.iter().map(|o| o.target_basename.as_str()).collect();
         assert!(basenames.contains(&"Show - 01.idx"));
@@ -397,7 +540,7 @@ mod tests {
         let v = vec![entry("/media/Show - 01.mkv")];
         let s = vec![entry("/media/Show.S01E01.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &SuffixConfig::default(), &NoExists, ActionMode::Auto);
+        let plan = generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Auto);
         assert_eq!(plan.ops[0].action, PlannedAction::Rename);
     }
 
@@ -414,7 +557,7 @@ mod tests {
         let v = vec![entry("/media/Show - 01.mkv")];
         let s = vec![entry("/media/Show.S01E01.chs.ass"), entry("/media/Show.S01E01.chs.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &SuffixConfig::default(), &NoExists, ActionMode::Auto);
+        let plan = generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Auto);
         assert!(plan.has_conflicts());
         assert!(
             plan.ops
@@ -435,7 +578,7 @@ mod tests {
         let v = vec![entry("/media/Show - 01.mkv")];
         let s = vec![entry("/subs/Show.S01E01.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &SuffixConfig::default(), &AlwaysExists, ActionMode::Auto);
+        let plan = generate_plan(&r, &NamingConfig::default(), &AlwaysExists, ActionMode::Auto);
         assert!(plan.has_conflicts());
         assert!(
             plan.ops
@@ -450,7 +593,7 @@ mod tests {
         let v = vec![entry("/media/Show - 01.mkv")];
         let s = vec![entry("/media/Show.S01E01.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &SuffixConfig::default(), &NoExists, ActionMode::Auto);
+        let plan = generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Auto);
         assert_eq!(plan.ops[0].action, PlannedAction::Rename);
     }
 
@@ -460,7 +603,7 @@ mod tests {
         let v = vec![entry("/videos/Show - 01.mkv")];
         let s = vec![entry("/subs/Show.S01E01.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &SuffixConfig::default(), &NoExists, ActionMode::Auto);
+        let plan = generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Auto);
         assert_eq!(plan.ops[0].action, PlannedAction::Copy);
     }
 
@@ -470,7 +613,75 @@ mod tests {
         let v = vec![entry("/media/Show - 01.mkv")];
         let s = vec![entry("/media/Show.S01E01.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &SuffixConfig::default(), &NoExists, ActionMode::Copy);
+        let plan = generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Copy);
         assert_eq!(plan.ops[0].action, PlannedAction::Copy);
+    }
+
+    fn mapping(token: &str, value: &str, var: &str) -> TokenMapping {
+        TokenMapping {
+            token: token.into(),
+            value: value.into(),
+            var: var.into(),
+            scope: MappingScope::Global,
+        }
+    }
+
+    #[test]
+    fn resolve_vars_collects_multiple_vars() {
+        let cfg = NamingConfig {
+            mappings: vec![
+                mapping("X2&CASO", "华盟字幕社", "group"),
+                mapping("track3", "zh-Hans", "lang"),
+            ],
+            ..NamingConfig::default()
+        };
+        let sub = entry("[X2&CASO][Death_Note][01]_track3.ass");
+        let vars = cfg.resolve_vars(&sub);
+        assert_eq!(vars.get("group").map(String::as_str), Some("华盟字幕社"));
+        assert_eq!(vars.get("lang").map(String::as_str), Some("zh-Hans"));
+    }
+
+    #[test]
+    fn resolve_vars_longest_token_wins() {
+        let cfg = NamingConfig {
+            mappings: vec![mapping("track", "short", "lang"), mapping("track3", "zh-Hans", "lang")],
+            ..NamingConfig::default()
+        };
+        let sub = entry("..._track3.ass");
+        let vars = cfg.resolve_vars(&sub);
+        assert_eq!(vars.get("lang").map(String::as_str), Some("zh-Hans"));
+    }
+
+    #[test]
+    fn resolve_vars_case_sensitive() {
+        let cfg = NamingConfig {
+            case_sensitive: true,
+            mappings: vec![mapping("chs", "zh-Hans", "lang")],
+            ..NamingConfig::default()
+        };
+        assert_eq!(cfg.resolve_vars(&entry("Show.CHS.ass")).get("lang").map(String::as_str), None);
+        assert_eq!(
+            cfg.resolve_vars(&entry("Show.chs.ass")).get("lang").map(String::as_str),
+            Some("zh-Hans")
+        );
+    }
+
+    #[test]
+    fn render_template_custom_var_and_empty_video() {
+        let mut vars = HashMap::new();
+        vars.insert("dual".to_string(), "简日双语".to_string());
+        assert_eq!(
+            render_template("${video}.${dual}.${ext}", &vars, "Show - 01", "ass"),
+            "Show - 01.简日双语.ass"
+        );
+        assert_eq!(
+            render_template(
+                "${video}.${group}-${lang}.${ext}",
+                &HashMap::new(),
+                "Show - 01",
+                "ass"
+            ),
+            "Show - 01.ass"
+        );
     }
 }
