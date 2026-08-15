@@ -6,12 +6,9 @@
 //!     a `📁 Browse (Auto)…` entry (files or folder, auto-classified)
 //!     and a `🗑 Clear all` button at the bottom.
 //!   - `TopBottomPanel::top` (toolbar): `Action:` `ComboBox` on the left,
-//!     `▶ Apply` (green, rightmost), `📜 History`, `⚙ Settings`,
-//!     `📋 Copy mv` packed right-to-left.
-//!   - `TopBottomPanel::bottom` (status): multi-line `Video dir:` /
-//!     `Subtitle dir:` (full paths in monospace, never truncated;
-//!     multi-folder shows `N folders` with hover listing all paths)
-//!     + `status_message`.
+//!     `▶ Apply` (green, rightmost), `📜 History`, `📋 Copy mv` packed
+//!     right-to-left.
+//!   - `TopBottomPanel::bottom` (status): `status_message`.
 //!   - `CentralPanel`: history hint banner (if any), inline `⚙ Settings`
 //!     collapsing header, three-column `TableBuilder`,
 //!     `Unmatched / unknown` collapsing.
@@ -91,10 +88,11 @@ pub struct App {
     // Modal / panel toggles.
     pub show_confirm: bool,
     pub show_history: bool,
-    /// Whether the inline Settings `CollapsingHeader` in `CentralPanel`
-    /// is forced open. Toggled by the `⚙ Settings` button in the top
-    /// toolbar.
-    pub show_settings: bool,
+
+    /// Initial left-panel width, computed once on the first layout pass
+    /// from the available width. `None` until then; egui persists any
+    /// user-dragged width for the rest of the session.
+    sidebar_width: Option<f32>,
 
     // User-selected action policy: Auto (D5 default) or Copy (always
     // preserve originals). Persisted in the config so it survives restart.
@@ -156,7 +154,7 @@ impl App {
             status_message: String::from("Use Browse to load files, or start from a media folder."),
             show_confirm: false,
             show_history: false,
-            show_settings: false,
+            sidebar_width: None,
             history_hint: Vec::new(),
             undo_selection: HashMap::new(),
             checksum_collision: Vec::new(),
@@ -670,7 +668,6 @@ impl App {
                 }
 
                 ui.toggle_value(&mut self.show_history, "📜 History");
-                ui.toggle_value(&mut self.show_settings, "⚙ Settings");
 
                 if ui
                     .add_enabled(can_apply, egui::Button::new("📋 Copy mv"))
@@ -691,13 +688,7 @@ impl App {
     // -----------------------------------------------------------------
 
     fn render_status_bar(&self, ui: &mut egui::Ui) {
-        ui.vertical(|ui| {
-            ui.label("Video dir:");
-            render_side_dirs(ui, &self.video_entries);
-            ui.label("Subtitle dir:");
-            render_side_dirs(ui, &self.subtitle_entries);
-            ui.label(&self.status_message);
-        });
+        ui.label(&self.status_message);
     }
 
     // -----------------------------------------------------------------
@@ -836,10 +827,9 @@ impl App {
     }
 
     fn render_settings(&mut self, ui: &mut egui::Ui) {
-        // The header's open state is locked to `show_settings`, which
-        // is toggled by the `⚙ Settings` button in the toolbar — so
-        // users can't bypass the toolbar by clicking the header.
-        egui::CollapsingHeader::new("⚙ Settings ▾").open(Some(self.show_settings)).show(ui, |ui| {
+        // The header is a plain collapsible header, like the
+        // "Unmatched / unknown" section below.
+        egui::CollapsingHeader::new("⚙ Settings ▾").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Global suffix:");
                 if ui.text_edit_singleline(&mut self.global_suffix_input).changed() {
@@ -1123,22 +1113,6 @@ fn unique_parents(entries: &[FileEntry]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Render a single line in the bottom status bar: full monospace path
-/// for one directory, or `N folders` with a hover listing all paths.
-fn render_side_dirs(ui: &mut egui::Ui, entries: &[FileEntry]) {
-    if entries.is_empty() {
-        ui.monospace("(none)");
-        return;
-    }
-    let parents = unique_parents(entries);
-    if parents.len() == 1 {
-        ui.monospace(parents[0].display().to_string());
-        return;
-    }
-    let tooltip = parents.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n");
-    ui.monospace(format!("{} folders", parents.len())).on_hover_text(tooltip);
-}
-
 fn preview_for_group(group: &PairGroup, plan: Option<&Plan>) -> String {
     let Some(plan) = plan else {
         return String::new();
@@ -1209,12 +1183,19 @@ impl eframe::App for App {
         self.drain_refresh();
 
         // Left: sidebar with two source CollapsingHeaders + Auto entries.
-        egui::Panel::left("source").resizable(true).min_size(220.0).max_size(320.0).show(
-            ui,
-            |ui| {
+        // Initial width is proportional to the window; egui persists any
+        // user-dragged width for the rest of the session.
+        let sidebar_default = *self.sidebar_width.get_or_insert_with(|| {
+            let w = ui.available_width();
+            if w > 0.0 { (w * 0.25).max(220.0) } else { 220.0 }
+        });
+        egui::Panel::left("source")
+            .resizable(true)
+            .default_size(sidebar_default)
+            .min_size(220.0)
+            .show(ui, |ui| {
                 self.render_sidebar(ui);
-            },
-        );
+            });
 
         // Top toolbar.
         egui::Panel::top("toolbar").show(ui, |ui| {
