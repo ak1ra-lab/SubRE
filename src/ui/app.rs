@@ -757,7 +757,7 @@ impl App {
                             row.col(|_ui| {});
                         });
                     }
-                    for (group_index, group) in result.groups.iter().enumerate() {
+                    for group in &result.groups {
                         let video_label =
                             group.video.as_ref().map_or_else(|| "—".into(), path_label);
                         let preview = preview_for_group(group, plan.as_ref());
@@ -780,17 +780,12 @@ impl App {
                                     for sub in &group.subtitles {
                                         ui.horizontal(|ui| {
                                             ui.label(path_label(sub));
-                                            // Per-row "detach" button:
-                                            // re-pairing is exposed via
-                                            // `Matcher::manual_detach` /
-                                            // `manual_attach`. The actual
-                                            // reassignment UI uses a row
-                                            // index; here we just offer a
-                                            // detach for the first sub.
-                                            if ui.small_button("x").clicked()
-                                                && let Some(r) = self.match_result.as_mut()
-                                            {
-                                                Matcher::new().manual_detach(r, group_index, 0);
+                                            // Per-row "remove" button: drop
+                                            // this subtitle from the loaded
+                                            // set and refresh.
+                                            if ui.small_button("x").clicked() {
+                                                self.subtitle_entries
+                                                    .retain(|e| e.path != sub.path);
                                                 self.refresh_match_and_plan();
                                             }
                                         });
@@ -850,7 +845,12 @@ impl App {
                 if ui.text_edit_singleline(&mut self.global_suffix_input).changed() {
                     self.refresh_match_and_plan();
                 }
-                ui.checkbox(&mut self.auto_extract_toggle, "Auto-detect language token");
+                if ui
+                    .checkbox(&mut self.auto_extract_toggle, "Auto-detect language token")
+                    .changed()
+                {
+                    self.refresh_match_and_plan();
+                }
                 if ui.button("Save config").clicked() {
                     let cfg = self.current_config();
                     if let Err(e) = ConfigStore::save_default(&cfg) {
@@ -858,15 +858,21 @@ impl App {
                     } else {
                         self.config = cfg;
                     }
+                    self.refresh_match_and_plan();
                 }
             });
             ui.label("Token → suffix map:");
             let mut to_remove: Option<usize> = None;
+            let mut edited = false;
             for (i, (k, v)) in self.token_map_editor.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
-                    ui.text_edit_singleline(k);
+                    if ui.text_edit_singleline(k).changed() {
+                        edited = true;
+                    }
                     ui.label("→");
-                    ui.text_edit_singleline(v);
+                    if ui.text_edit_singleline(v).changed() {
+                        edited = true;
+                    }
                     if ui.button("x").clicked() {
                         to_remove = Some(i);
                     }
@@ -876,8 +882,12 @@ impl App {
                 self.token_map_editor.remove(i);
                 self.refresh_match_and_plan();
             }
+            if edited {
+                self.refresh_match_and_plan();
+            }
             if ui.button("+ add mapping").clicked() {
                 self.token_map_editor.push((String::new(), String::new()));
+                self.refresh_match_and_plan();
             }
             ui.horizontal(|ui| {
                 ui.label("Video regex (fallback):");
