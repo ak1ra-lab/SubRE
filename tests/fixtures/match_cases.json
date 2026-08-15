@@ -131,6 +131,33 @@
         ["Death_Note - 02", "Death_Note - 02"],
         ["Death_Note - SP 01", "Death_Note - SP 01"]
       ]
+    },
+    {
+      "name": "mixed-naming-styles-cross-style-pairing",
+      "videos": [
+        "Death_Note - 01.mkv",
+        "Death_Note - 02.mkv",
+        "Death_Note - 03.mkv",
+        "Death_Note - 04.mkv",
+        "Death_Note - 05.mkv",
+        "Death_Note - 06.mkv"
+      ],
+      "subtitles": [
+        "[X2&CASO][Death_Note][JP_GB_BIG5][01][DVDRIP]_track3.ass",
+        "[X2&CASO][Death_Note][JP_GB_BIG5][02][DVDRIP]_track3.ass",
+        "[X2&CASO][Death_Note][JP_GB_BIG5][03][DVDRIP]_track3.ass",
+        "[X2&CASO][Death_Note][JP_GB_BIG5][04][DVDRIP]_track3.ass",
+        "[X2-Raws][Death_Note][05][DVDRIP].sn.ass",
+        "[X2-Raws][Death_Note][06][DVDRIP].sn.ass"
+      ],
+      "expected_pairs": [
+        ["Death_Note - 01", "[X2&CASO][Death_Note][JP_GB_BIG5][01][DVDRIP]_track3"],
+        ["Death_Note - 02", "[X2&CASO][Death_Note][JP_GB_BIG5][02][DVDRIP]_track3"],
+        ["Death_Note - 03", "[X2&CASO][Death_Note][JP_GB_BIG5][03][DVDRIP]_track3"],
+        ["Death_Note - 04", "[X2&CASO][Death_Note][JP_GB_BIG5][04][DVDRIP]_track3"],
+        ["Death_Note - 05", "[X2-Raws][Death_Note][05][DVDRIP].sn"],
+        ["Death_Note - 06", "[X2-Raws][Death_Note][06][DVDRIP].sn"]
+      ]
     }
   ]
 }

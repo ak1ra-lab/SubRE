@@ -85,11 +85,58 @@ impl Matcher {
         Self
     }
 
-    /// Match `videos` and `subtitles` using the default (diff) key
-    /// extraction. Optional per-side regex overrides are consulted when
+    /// Match `videos` and `subtitles`. A single cross-side alignment pass
+    /// picks one slot pair and favors the dominant naming style, so mixed
+    /// batches are re-matched iteratively over the leftover subset until no
+    /// progress is made. Optional per-side regex overrides are consulted when
     /// provided.
     pub fn match_files(
         &self,
+        videos: &[FileEntry],
+        subtitles: &[FileEntry],
+        video_regex: Option<&str>,
+        subtitle_regex: Option<&str>,
+    ) -> MatchResult {
+        let mut result = Self::match_once(videos, subtitles, video_regex, subtitle_regex);
+
+        let mut prev_leftover = videos.len().saturating_add(subtitles.len()).saturating_add(1);
+        loop {
+            let leftover_videos: Vec<FileEntry> = result.unmatched_videos().cloned().collect();
+            let leftover_subs: Vec<FileEntry> = result.unmatched_subtitles().cloned().collect();
+            if leftover_videos.is_empty() || leftover_subs.is_empty() {
+                break;
+            }
+            let leftover = leftover_videos.len().saturating_add(leftover_subs.len());
+            if leftover >= prev_leftover {
+                break;
+            }
+            prev_leftover = leftover;
+
+            // Only re-match when the subset still qualifies for cross-side
+            // alignment. Small leftovers fall back to per-file heuristics,
+            // which extract the wrong key (e.g. the season `S02` instead of
+            // the episode) and would produce spurious pairs.
+            if leftover_videos.len() <= 1
+                || leftover_subs.len() <= 1
+                || video_regex.is_some()
+                || subtitle_regex.is_some()
+            {
+                break;
+            }
+
+            let sub =
+                Self::match_once(&leftover_videos, &leftover_subs, video_regex, subtitle_regex);
+            result.groups.retain(|g| !is_leftover(g));
+            result.groups.extend(sub.groups);
+        }
+
+        // Deterministic ordering, mirroring the original BTreeMap iteration.
+        result.groups.sort_by(|a, b| a.key.cmp(&b.key));
+        result
+    }
+
+    /// Single-pass match over `videos` and `subtitles`.
+    fn match_once(
         videos: &[FileEntry],
         subtitles: &[FileEntry],
         video_regex: Option<&str>,
@@ -280,6 +327,13 @@ fn compute_keys(files: &[FileEntry], regex_override: Option<&str>) -> Vec<Option
     raws.iter().map(|r| normalize_key(r.0.as_deref())).collect()
 }
 
+/// True for groups that contribute nothing to a match: a lone video, or a
+/// lone subtitle. These are the leftovers re-matched in [`Matcher::match_files`].
+fn is_leftover(group: &PairGroup) -> bool {
+    (group.video.is_some() && group.subtitles.is_empty())
+        || (group.video.is_none() && !group.subtitles.is_empty())
+}
+
 fn heuristic_keys(files: &[FileEntry]) -> Vec<Option<EpisodeKey>> {
     files
         .iter()
@@ -361,6 +415,74 @@ mod tests {
         }
         assert_eq!(r.unmatched_videos().count(), 0);
         assert_eq!(r.unmatched_subtitles().count(), 0);
+    }
+
+    #[test]
+    fn mixed_naming_styles_pair_across_styles() {
+        let m = Matcher::new();
+        // Uniform video side; subtitle side mixes two layouts that place the
+        // episode token at different field offsets, so a single cross-side
+        // alignment pass can only satisfy one of them.
+        let videos: Vec<FileEntry> =
+            (1..=6).map(|i| entry(&format!("Death_Note - {i:02}.mkv"))).collect();
+        // Style A (eps 1-4): the extra [JP_GB_BIG5] segment pushes the
+        // episode token to a deeper field slot.
+        let style_a: Vec<FileEntry> = (1..=4)
+            .map(|i| {
+                entry(&format!("[X2&CASO][Death_Note][JP_GB_BIG5][{i:02}][DVDRIP]_track3.ass"))
+            })
+            .collect();
+        // Style B (eps 5-6): no extra segment, episode token at a shallower slot.
+        let style_b: Vec<FileEntry> = (5..=6)
+            .map(|i| entry(&format!("[X2-Raws][Death_Note][{i:02}][DVDRIP].sn.ass")))
+            .collect();
+        let subtitles: Vec<FileEntry> = style_a.into_iter().chain(style_b).collect();
+
+        let r = m.match_files(&videos, &subtitles, None, None);
+        assert_eq!(r.unmatched_videos().count(), 0, "every video should pair");
+        assert_eq!(r.unmatched_subtitles().count(), 0, "every subtitle should pair");
+
+        let mut pairs: Vec<(String, String)> = r
+            .groups
+            .iter()
+            .filter_map(|g| {
+                g.video
+                    .as_ref()
+                    .zip(g.subtitles.first())
+                    .map(|(v, s)| (v.stem.clone(), s.stem.clone()))
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(pairs.len(), 6);
+        // Style B subtitles pair to their own videos, not to style A slots.
+        for ep in ["05", "06"] {
+            assert!(
+                pairs.iter().any(|(v, s)| v.ends_with(ep)
+                    && s.contains("X2-Raws")
+                    && s.contains(&format!("[{ep}]"))),
+                "episode {ep} should pair to its [X2-Raws] subtitle: {pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn iteration_terminates_and_preserves_unmatched() {
+        let m = Matcher::new();
+        let v = vec![
+            entry("[G] Show - 01.mkv"),
+            entry("[G] Show - 02.mkv"),
+            entry("[G] Show - 03.mkv"),
+        ];
+        let s = vec![
+            entry("Show.S01E01.chs.ass"),
+            entry("Show.S01E02.chs.ass"),
+            entry("Show.S01E03.chs.ass"),
+            entry("Other.NCOP.ass"),
+        ];
+        let r = m.match_files(&v, &s, None, None);
+        assert_eq!(r.unmatched_videos().count(), 0);
+        assert_eq!(r.unmatched_subtitles().count(), 1);
+        assert!(r.unmatched_subtitles().any(|s| s.stem.contains("NCOP")));
     }
 
     #[test]
