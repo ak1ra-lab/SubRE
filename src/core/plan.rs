@@ -7,7 +7,7 @@
 //! the target path, used to flag conflicts when the target file already
 //! exists on disk.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -309,8 +309,10 @@ pub fn generate_plan(
             video.as_ref().map_or_else(|| group.subtitles[0].stem.clone(), |v| v.stem.clone());
 
         // Group the group's subtitles by stem-base (basename without last
-        // extension) to detect .idx+.sub pairs.
-        let mut units: HashMap<String, Vec<&FileEntry>> = HashMap::new();
+        // extension) to detect .idx+.sub pairs. A BTreeMap keeps the units
+        // (and thus the plan ops) in deterministic, cross-group-consistent
+        // lexicographic order.
+        let mut units: BTreeMap<String, Vec<&FileEntry>> = BTreeMap::new();
         for sub in &group.subtitles {
             let base = stem_base(&sub.stem);
             units.entry(base).or_default().push(sub);
@@ -416,6 +418,23 @@ mod tests {
 
     fn entry(name: &str) -> FileEntry {
         FileEntry::from_path(PathBuf::from(name))
+    }
+
+    #[test]
+    fn plan_ops_sorted_by_subtitle_stem() {
+        let m = Matcher::new();
+        let v = vec![entry("/videos/Show - 01.mkv")];
+        // Deliberately out-of-order ingestion; stems have no internal dots so
+        // each subtitle is its own unit.
+        let s = vec![
+            entry("/subs/Show 01 _z.ass"),
+            entry("/subs/Show 01 _a.ass"),
+            entry("/subs/Show 01 _m.ass"),
+        ];
+        let r = m.match_files(&v, &s, None, None);
+        let plan = generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Auto);
+        let stems: Vec<&str> = plan.ops.iter().map(|o| o.subtitle.stem.as_str()).collect();
+        assert_eq!(stems, vec!["Show 01 _a", "Show 01 _m", "Show 01 _z"]);
     }
 
     #[test]

@@ -779,13 +779,14 @@ impl App {
                         body.row(26.0, |mut row| {
                             row.col(|ui| {
                                 if let Some(v) = video {
-                                    if prev_video.as_ref() != Some(&v.path) {
-                                        prev_video = Some(v.path.clone());
-                                        if subtitle.is_none() {
-                                            ui.colored_label(egui::Color32::YELLOW, path_label(v));
-                                        } else {
-                                            ui.label(path_label(v));
-                                        }
+                                    let repeat = prev_video.as_ref() == Some(&v.path);
+                                    prev_video = Some(v.path.clone());
+                                    if repeat {
+                                        ui.weak(path_label(v));
+                                    } else if subtitle.is_none() {
+                                        ui.colored_label(egui::Color32::YELLOW, path_label(v));
+                                    } else {
+                                        ui.label(path_label(v));
                                     }
                                 } else {
                                     prev_video = None;

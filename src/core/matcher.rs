@@ -280,7 +280,12 @@ impl Matcher {
             });
         }
 
-        MatchResult { groups: by_key.into_values().collect() }
+        let mut groups: Vec<PairGroup> = by_key.into_values().collect();
+        for group in &mut groups {
+            // Deterministic, cross-group-consistent subtitle ordering.
+            group.subtitles.sort_by(|a, b| a.stem.cmp(&b.stem));
+        }
+        MatchResult { groups }
     }
 
     /// Manually attach a subtitle to a video (by index in the result).
@@ -493,6 +498,36 @@ mod tests {
         let r = m.match_files(&v, &s, None, None);
         assert_eq!(r.groups.len(), 1);
         assert_eq!(r.groups[0].subtitles.len(), 2);
+    }
+
+    #[test]
+    fn subtitles_sorted_within_group() {
+        let m = Matcher::new();
+        let v = vec![entry("Show - 01.mkv")];
+        // Deliberately out-of-order ingestion.
+        let s = vec![
+            entry("Show.S01E01._track5.ass"),
+            entry("Show.S01E01._track3.ass"),
+            entry("Show.S01E01._track4.ass"),
+        ];
+        let r = m.match_files(&v, &s, None, None);
+        assert_eq!(r.groups.len(), 1);
+        let stems: Vec<&str> = r.groups[0].subtitles.iter().map(|f| f.stem.as_str()).collect();
+        assert_eq!(
+            stems,
+            vec!["Show.S01E01._track3", "Show.S01E01._track4", "Show.S01E01._track5"]
+        );
+    }
+
+    #[test]
+    fn idx_sub_pair_stays_adjacent() {
+        let m = Matcher::new();
+        let v = vec![entry("Show - 01.mkv")];
+        let s = vec![entry("Show.S01E01.idx"), entry("Show.S01E01.sub")];
+        let r = m.match_files(&v, &s, None, None);
+        assert_eq!(r.groups.len(), 1);
+        let exts: Vec<&str> = r.groups[0].subtitles.iter().map(|f| f.ext.as_str()).collect();
+        assert_eq!(exts, vec!["idx", "sub"]);
     }
 
     #[test]
