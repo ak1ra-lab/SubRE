@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=subtitle-renamer
+Comment=Batch-rename external subtitle files to match paired video filenames
+Exec=@BINDIR@/subtitle-renamer
+Icon=subtitle-renamer
+Terminal=false
+Categories=AudioVideo;Utility;

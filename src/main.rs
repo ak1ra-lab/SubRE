@@ -14,7 +14,13 @@ fn main() -> eframe::Result<()> {
     if let Some(msg) = &font_notice {
         eprintln!("{msg}");
     }
-    let options = eframe::NativeOptions::default();
+    let mut viewport = egui::ViewportBuilder::default();
+    if let Ok(icon) =
+        eframe::icon_data::from_png_bytes(include_bytes!("../assets/subtitle-renamer.png"))
+    {
+        viewport = viewport.with_icon(icon);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
         "subtitle-renamer",
         options,
