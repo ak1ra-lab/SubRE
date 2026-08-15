@@ -9,21 +9,21 @@
 - **自动配对**: 基于文件名集合内差异片段提取集数 key, 无需固定命名格式. 支持正则兜底与手动指派.
 - **目标名生成**: 视频主名 + 可选后缀 + 字幕原扩展名. `.idx` + `.sub` 成对作为同一逻辑单元.
 - **后缀三级解析**: 用户标记映射表 → 文件名语言 token 自动提取 → 全局后缀.
-- **执行安全**: 同目录 rename, 跨目录 copy (保护原件). 每次执行写入 sqlite 历史, 可按路径查询命中.
-- **可还原**: rename/copy 均记录 mtime + size 快照, 还原前校验完整性, 任何一项不一致即拒绝还原.
+- **执行安全**: 同目录 rename, 跨目录 copy (保护原件). 原地改名写入 sqlite 历史, 按 (目录, 校验和) 身份反查命名史.
+- **可还原**: 原地改名记录 checksum 身份, 还原前重算校验和比对, 不一致即拒绝还原; copy 不落历史.
 - **冲突检测**: 目标名重复 / 目标路径已存在均会标记冲突并阻止执行.
 
 ## 安装
 
 ```bash
-# release build (~20 MB stripped; eframe + wgpu + unicode-normalization)
+# release build (~19 MB stripped)
 cargo build --release
 ./target/release/subtitle-renamer
 ```
 
 ## 使用
 
-1. 从文件管理器拖入一个或多个文件 / 文件夹.
+1. 通过 Browse 按钮载入视频/字幕文件或文件夹(或在媒体目录下启动自动扫描当前目录).
 2. 主界面呈现视频 | 字幕 | 目标文件名 三列视图.
 3. 调整后缀(全局后缀, token→后缀映射), 预览即时刷新.
 4. 检查未匹配项 / 冲突项,必要时手动解除或编辑.
@@ -38,13 +38,21 @@ cargo build --release
 ## 配置示例
 
 ```toml
-[video_regex]
-# subtitle_regex = "(?i)ep(\\d+)"
+custom_video_exts = []
+custom_subtitle_exts = []
+action_mode = "Auto"
 
 [suffix]
 global = ""
 auto_extract_language_token = false
-token_map = { chs = "zh-Hans", cht = "zh-Hant" }
+
+[suffix.token_map]
+chs = "zh-Hans"
+cht = "zh-Hant"
+
+# 可选: 正则兜底(各含一个捕获组提取集数)
+# video_regex = "(?i)ep(\\d+)"
+# subtitle_regex = "(?i)ep(\\d+)"
 ```
 
 ## 开发
@@ -62,9 +70,8 @@ cargo build --release
 src/
 ├── main.rs              # eframe 入口
 ├── lib.rs               # 公开 crate API
-├── ui/                  # GUI 层 (依赖 eframe + wgpu)
-│   ├── app.rs           # eframe::App 实现: 三列表格, 拖入, 后缀栏, 历史面板
-│   ├── dnd_drop.rs      # 拖放接收
+├── ui/                  # GUI 层 (依赖 eframe)
+│   ├── app.rs           # eframe::App 实现: 三列表格, Browse 载入, 设置栏, 历史面板
 │   └── fonts.rs         # CJK 字体注册(确保中文/日文界面可见)
 └── core/                # GUI-free, 可独立单测
     ├── parse.rs         # 文件类型识别 + token 对齐 key 提取 + 归一化 (NFKD / whitespace)

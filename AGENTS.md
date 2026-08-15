@@ -20,7 +20,7 @@ Strict. Configured in `rustfmt.toml`, `clippy.toml`, and `Cargo.toml` `[lints]`.
 ## Module layout
 
 - `src/core/` — GUI-free, unit-tested: `parse.rs`, `matcher.rs`, `plan.rs`, `execute.rs`, `history.rs`, `config.rs`. New behavior goes here first.
-- `src/ui/` — `app.rs` (eframe::App), `dnd_drop.rs`, `fonts.rs` (CJK font registered at startup — preserve).
+- `src/ui/` — `app.rs` (eframe::App), `fonts.rs` (CJK font registered at startup — preserve).
 - `tests/corpus.rs` + `tests/fixtures/` — integration tests driven by JSON fixtures.
 - `src/main.rs` is a thin eframe launcher; `src/lib.rs` is the public API.
 
@@ -28,7 +28,7 @@ Strict. Configured in `rustfmt.toml`, `clippy.toml`, and `Cargo.toml` `[lints]`.
 
 - `EpisodeKey` in `src/core/parse.rs` has a custom numeric-aware `Ord` — do **not** re-derive `PartialOrd`/`Ord` (see comment on the impl).
 - Config source-of-truth is `UserConfig` in `src/core/config.rs`. The TOML layout under `[suffix]`, `custom_*_exts`, `video_regex`, `subtitle_regex`, `action_mode` is canonical.
-- `ActionMode` (Auto/Copy/Move) is global per plan; per-op override is out of scope.
+- `ActionMode` (Auto/Copy) is global per plan; per-op override is out of scope.
 - CJK strings in spec / delta files are intentional; the CJK font is registered at GUI startup (`src/ui/fonts.rs`).
 
 ## Test conventions
@@ -39,8 +39,8 @@ Strict. Configured in `rustfmt.toml`, `clippy.toml`, and `Cargo.toml` `[lints]`.
 
 ## OpenSpec workflow
 
-`openspec/` is the source of truth for spec-driven change management. New work goes in `openspec/changes/<name>/` with `proposal.md` + `specs/**/*.md` + `design.md` + `tasks.md`. After implementation, archive to `openspec/changes/archive/YYYY-MM-DD-<name>/` via `openspec archive`. The CLI is `openspec` (already installed); schema is `spec-driven`. The `openspec` branch holds spec/change artifacts; the `dev` branch holds code; PRs flow `openspec` → `dev` after each change is implemented and archived.
+`openspec/` is the source of truth; CLI is `openspec` (schema `spec-driven`). A change lives in `openspec/changes/<name>/`; `openspec archive` moves it to `openspec/changes/archive/` and syncs deltas into `openspec/specs/`.
 
-## Note on README.md
+Branches: `dev` = code only; `openspec` = spec/change artifacts only. Start on `openspec`.
 
-`README.md` is partially stale (module tree missing `dnd_drop.rs`/`fonts.rs`, binary-size note predates the current deps, "Per design D2" references a doc that doesn't live in the repo). Treat the code as the source of truth; do not derive structure or behavior from `README.md` until it's refreshed.
+Per change: propose & commit → apply → archive & commit → `git checkout dev`, commit code → `git checkout openspec`, `git rebase dev`.
