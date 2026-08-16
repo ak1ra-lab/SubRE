@@ -6,9 +6,9 @@
 //!     a `📁 Browse (Auto)…` entry (files or folder, auto-classified)
 //!     and a `🗑 Clear all` button at the bottom.
 //!   - `TopBottomPanel::top` (toolbar): `Action:` `ComboBox` on the left,
-//!     `▶ Apply` (green, rightmost), `📜 History`, `📋 Copy mv` packed
-//!     right-to-left.
-//!   - `TopBottomPanel::bottom` (status): `status_message`.
+//!     `ℹ About` (rightmost), `▶ Apply` (green), `📜 History`, `📋 Copy mv`
+//!     packed right-to-left.
+//!   - `TopBottomPanel::bottom` (status): scrollable, resizable `status_log`.
 //!   - `CentralPanel`: history hint banner (if any), inline `⚙ Settings`
 //!     collapsing header, three-column `TableBuilder`,
 //!     `Unmatched / unknown` collapsing.
@@ -34,6 +34,19 @@ use crate::core::plan::{
     ActionMode, Conflict, MappingScope, NamingConfig, Plan, PlannedAction, PlannedOp, StdFsProbe,
     TokenMapping, generate_plan,
 };
+
+/// Upper bound on the number of status-log lines retained. The log is
+/// append-only; entries past this limit are dropped from the front.
+const MAX_LOG_LINES: usize = 10_000;
+
+/// Default status-bar height in points (about four body-font lines).
+const STATUS_DEFAULT_HEIGHT: f32 = 72.0;
+
+/// Minimum status-bar height in points (a single line).
+const STATUS_MIN_HEIGHT: f32 = 24.0;
+
+/// Canonical repository URL, shown in the About dialog.
+const REPO_URL: &str = "https://github.com/ak1ra-lab/subtitle-renamer";
 
 /// Which side a path should be ingested onto when the user explicitly
 /// picks `Browse…`.
@@ -77,7 +90,7 @@ pub struct App {
     pub match_result: Option<MatchResult>,
     pub plan: Option<Plan>,
 
-    pub status_message: String,
+    pub status_log: Vec<String>,
 
     // Editable UI fields.
     pub template_input: String,
@@ -90,6 +103,7 @@ pub struct App {
     // Modal / panel toggles.
     pub show_confirm: bool,
     pub show_history: bool,
+    pub show_about: bool,
 
     /// Initial left-panel width, computed once on the first layout pass
     /// from the available width. `None` until then; egui persists any
@@ -121,9 +135,6 @@ pub struct App {
     refresh_epoch: u64,
     /// True while a result for the current epoch is still in flight.
     refresh_pending: bool,
-    /// One-shot summary of the last Apply/undo run, appended to the next
-    /// refresh's status message so it survives the async round-trip.
-    result_note: Option<String>,
 }
 
 impl App {
@@ -158,9 +169,12 @@ impl App {
             unknown_entries: Vec::new(),
             match_result: None,
             plan: None,
-            status_message: String::from("Use Browse to load files, or start from a media folder."),
+            status_log: vec![String::from(
+                "Use Browse to load files, or start from a media folder.",
+            )],
             show_confirm: false,
             show_history: false,
+            show_about: false,
             sidebar_width: None,
             history_hint: Vec::new(),
             undo_selection: HashMap::new(),
@@ -169,7 +183,16 @@ impl App {
             refresh_rx,
             refresh_epoch: 0,
             refresh_pending: false,
-            result_note: None,
+        }
+    }
+
+    /// Append a line to the status log, trimming the front past
+    /// [`MAX_LOG_LINES`] so memory stays bounded.
+    pub fn push_status(&mut self, msg: impl Into<String>) {
+        self.status_log.push(msg.into());
+        if self.status_log.len() > MAX_LOG_LINES {
+            let excess = self.status_log.len() - MAX_LOG_LINES;
+            self.status_log.drain(..excess);
         }
     }
 
@@ -252,9 +275,9 @@ impl App {
         };
         if self.refresh_tx.send(request).is_ok() {
             self.refresh_pending = true;
-            self.status_message = "处理中…".into();
+            self.push_status("处理中…");
         } else {
-            self.status_message = "后台刷新线程不可用".into();
+            self.push_status("后台刷新线程不可用");
         }
     }
 
@@ -283,10 +306,7 @@ impl App {
         let n_subs = self.subtitle_entries.len();
         let n_vids = self.video_entries.len();
         let counts = format!("{n_vids} video(s), {n_subs} subtitle(s) → {n_groups} pair group(s)");
-        self.status_message = match self.result_note.take() {
-            Some(note) => format!("{note} · {counts}"),
-            None => counts,
-        };
+        self.push_status(counts);
     }
 
     /// Rebuild the drag-in history hint and collision warnings from the
@@ -345,13 +365,13 @@ impl App {
     /// collected into a report rather than aborting the whole run.
     pub fn apply(&mut self) {
         if self.refresh_pending {
-            self.status_message = "处理中,请稍候再执行。".into();
+            self.push_status("处理中,请稍候再执行。");
             return;
         }
         let plan = match self.plan.clone() {
             Some(p) if !p.has_conflicts() && !p.ops.is_empty() => p,
             _ => {
-                self.status_message = "Plan empty or has conflicts.".into();
+                self.push_status("Plan empty or has conflicts.");
                 return;
             }
         };
@@ -365,7 +385,7 @@ impl App {
         let session_id = match self.history.create_session(working_dir.as_deref()) {
             Ok(id) => id,
             Err(e) => {
-                self.status_message = format!("history session failed: {e}");
+                self.push_status(format!("history session failed: {e}"));
                 return;
             }
         };
@@ -418,7 +438,7 @@ impl App {
         }
         let ok = report.outcomes.iter().filter(|o| o.success).count();
         let bad = report.outcomes.iter().filter(|o| !o.success).count();
-        self.result_note = Some(format!("Executed: {ok} ok, {bad} failed"));
+        self.push_status(format!("Executed: {ok} ok, {bad} failed"));
         self.refresh_match_and_plan();
     }
 
@@ -441,38 +461,41 @@ impl App {
             old_name,
             new_name,
         ) {
-            self.status_message = format!("history write failed: {e}");
+            self.push_status(format!("history write failed: {e}"));
         }
     }
 
     /// Undo an entire session by id.
     pub fn undo_session(&mut self, session_id: i64) {
         if self.refresh_pending {
-            self.status_message = "处理中,请稍候再还原。".into();
+            self.push_status("处理中,请稍候再还原。");
             return;
         }
         let renames = match self.history.renames_for_session(session_id) {
             Ok(r) => r,
             Err(e) => {
-                self.status_message = format!("history read failed: {e}");
+                self.push_status(format!("history read failed: {e}"));
                 return;
             }
         };
         if renames.is_empty() {
-            self.status_message = "Nothing to undo in this session.".into();
+            self.push_status("Nothing to undo in this session.");
             return;
         }
         let units = group_units(&renames);
-        let selection =
-            self.undo_selection.entry(session_id).or_insert_with(|| vec![true; units.len()]);
-        if selection.len() != units.len() {
-            selection.resize(units.len(), true);
-        }
+        let selection = {
+            let stored =
+                self.undo_selection.entry(session_id).or_insert_with(|| vec![true; units.len()]);
+            if stored.len() != units.len() {
+                stored.resize(units.len(), true);
+            }
+            stored.clone()
+        };
 
         let undo_session = match self.history.create_undo_session(session_id, None) {
             Ok(id) => id,
             Err(e) => {
-                self.status_message = format!("history undo session failed: {e}");
+                self.push_status(format!("history undo session failed: {e}"));
                 return;
             }
         };
@@ -503,7 +526,7 @@ impl App {
                             &r.new_name,
                             &r.old_name,
                         ) {
-                            self.status_message = format!("history write failed: {e}");
+                            self.push_status(format!("history write failed: {e}"));
                         }
                     }
                     ok += 1;
@@ -511,7 +534,7 @@ impl App {
                 _ => bad += 1,
             }
         }
-        self.result_note = Some(format!("Undo: {ok} unit(s) ok, {bad} failed"));
+        self.push_status(format!("Undo: {ok} unit(s) ok, {bad} failed"));
         self.refresh_match_and_plan();
     }
 
@@ -659,10 +682,14 @@ impl App {
                     }
                 });
 
-            // Right-to-left cluster: Apply is rightmost (highest weight).
+            // Right-to-left cluster: About is rightmost, then Apply.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let can_apply = !self.refresh_pending
                     && self.plan.as_ref().is_some_and(|p| !p.ops.is_empty() && !p.has_conflicts());
+
+                if ui.button("ℹ About").clicked() {
+                    self.show_about = true;
+                }
 
                 if ui
                     .add_enabled(
@@ -685,7 +712,7 @@ impl App {
                 {
                     let script = mv_script(plan);
                     ui.ctx().copy_text(script);
-                    self.status_message = "Copied mv script to clipboard.".into();
+                    self.push_status("Copied mv script to clipboard.");
                 }
             });
         });
@@ -696,7 +723,14 @@ impl App {
     // -----------------------------------------------------------------
 
     fn render_status_bar(&self, ui: &mut egui::Ui) {
-        ui.label(&self.status_message);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(
+            ui,
+            |ui| {
+                for line in &self.status_log {
+                    ui.label(line);
+                }
+            },
+        );
     }
 
     // -----------------------------------------------------------------
@@ -960,10 +994,10 @@ impl App {
         toml_cfg.suffix.mappings = global;
         match ConfigStore::save_default(&toml_cfg) {
             Ok(()) => self.config = cfg,
-            Err(e) => self.status_message = format!("config save failed: {e}"),
+            Err(e) => self.push_status(format!("config save failed: {e}")),
         }
         if let Err(e) = self.history.replace_session_mappings(&session) {
-            self.status_message = format!("session mappings save failed: {e}");
+            self.push_status(format!("session mappings save failed: {e}"));
         }
         self.refresh_match_and_plan();
     }
@@ -1069,6 +1103,26 @@ impl App {
                         self.show_history = false;
                     }
                 });
+        }
+
+        // About window.
+        if self.show_about {
+            egui::Window::new("About").collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.heading(env!("CARGO_PKG_NAME"));
+                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                ui.separator();
+                ui.label(env!("CARGO_PKG_DESCRIPTION"));
+                ui.hyperlink_to("GitHub repository", REPO_URL);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("License:");
+                    ui.hyperlink_to("GPL-3.0-or-later", format!("{REPO_URL}/blob/master/LICENSE"));
+                });
+                ui.separator();
+                if ui.button("Close").clicked() {
+                    self.show_about = false;
+                }
+            });
         }
     }
 }
@@ -1250,9 +1304,13 @@ impl eframe::App for App {
         });
 
         // Bottom status bar (multi-line, full paths).
-        egui::Panel::bottom("status").show(ui, |ui| {
-            self.render_status_bar(ui);
-        });
+        egui::Panel::bottom("status")
+            .resizable(true)
+            .default_size(STATUS_DEFAULT_HEIGHT)
+            .min_size(STATUS_MIN_HEIGHT)
+            .show(ui, |ui| {
+                self.render_status_bar(ui);
+            });
 
         // Central panel — history hint, settings, table, unmatched.
         egui::CentralPanel::default().show(ui, |ui| {

@@ -48,7 +48,7 @@ fn main() -> eframe::Result<()> {
             });
             let mut app = App::new(config, history);
             if let Some(msg) = font_notice {
-                app.status_message = msg;
+                app.push_status(msg);
             }
             // Non-recursively scan the working directory and preload any
             // recognized video/subtitle files found there.
