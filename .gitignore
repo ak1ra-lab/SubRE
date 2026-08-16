@@ -163,3 +163,7 @@ tmbootpicker.efi
 # LLM
 .agents/sessions
 
+# General
+*.env
+config/
+examples/
