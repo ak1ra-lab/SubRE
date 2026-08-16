@@ -87,6 +87,10 @@ tests/
     └── match_cases_subrenamer.json   # 12 个 case, 移植自 qwqcode/SubRenamer (GPL-2.0)
 ```
 
+## AI 使用声明
+
+本项目在开发过程中大量使用 AI 辅助生成代码. 作者仍在学习 Rust, 尚未对全部代码进行独立人工审阅, 使用前请自行评估风险.
+
 ## 许可
 
 GPL-3.0-or-later. 详见 `LICENSE`. SubRenamer 语料来自 [qwqcode/SubRenamer](https://github.com/qwqcode/SubRenamer), 按 GPL-2.0 授权, 在 `tests/fixtures/match_cases_subrenamer.json` 文件头保留来源标注.
