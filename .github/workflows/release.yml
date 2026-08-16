@@ -1,0 +1,74 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: "1.97.1"
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+
+      - name: Set release version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "RELEASE_VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_VERSION=dev-${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build Linux
+        run: cargo build --release
+
+      - name: Build Windows
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Verify Windows DLL dependencies
+        run: |
+          x86_64-w64-mingw32-objdump -p target/x86_64-pc-windows-gnu/release/subtitle-renamer.exe | grep 'DLL Name'
+          ! x86_64-w64-mingw32-objdump -p target/x86_64-pc-windows-gnu/release/subtitle-renamer.exe | grep -q 'libwinpthread'
+
+      - name: Package Linux (tar.gz)
+        run: |
+          d="subtitle-renamer-${RELEASE_VERSION}-x86_64-linux"
+          mkdir -p "dist/$d"
+          cp target/release/subtitle-renamer "dist/$d/"
+          cp install.sh "dist/$d/"
+          cp -r assets "dist/$d/"
+          cp LICENSE "dist/$d/"
+          tar -czf "$d.tar.gz" -C dist "$d"
+
+      - name: Package Windows (zip)
+        run: |
+          d="subtitle-renamer-${RELEASE_VERSION}-x86_64-windows"
+          mkdir -p "dist/$d"
+          cp target/x86_64-pc-windows-gnu/release/subtitle-renamer.exe "dist/$d/"
+          cp LICENSE "dist/$d/"
+          (cd "dist/$d" && zip -r "../../$d.zip" .)
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: |
+            subtitle-renamer-*-x86_64-linux.tar.gz
+            subtitle-renamer-*-x86_64-windows.zip

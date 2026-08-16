@@ -10,12 +10,16 @@ bindir="${prefix}/bin"
 appsdir="${prefix}/share/applications"
 iconbasedir="${prefix}/share/icons/hicolor"
 
-if [ ! -f "target/release/subtitle-renamer" ]; then
-    printf 'Build first: cargo build --release\n' >&2
+if [ -f "./subtitle-renamer" ]; then
+    bin="./subtitle-renamer"
+elif [ -f "target/release/subtitle-renamer" ]; then
+    bin="target/release/subtitle-renamer"
+else
+    printf 'subtitle-renamer binary not found (expected ./subtitle-renamer or target/release/subtitle-renamer)\n' >&2
     exit 1
 fi
 
-install -Dm755 "target/release/subtitle-renamer" "${bindir}/subtitle-renamer"
+install -Dm755 "$bin" "${bindir}/subtitle-renamer"
 install -Dm644 "assets/subtitle-renamer.svg" "${iconbasedir}/scalable/apps/subtitle-renamer.svg"
 
 mkdir -p "${appsdir}"

@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use subtitle_renamer::core::config::{ConfigStore, UserConfig};
 use subtitle_renamer::core::history::HistoryDb;
 use subtitle_renamer::ui::app::App;

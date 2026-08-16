@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "Batch-rename external subtitle files to match paired video filenames"
-repository = "https://git.ak1ra.xyz/ak1ra-lab/subtitle-renamer"
+repository = "https://github.com/ak1ra-lab/subtitle-renamer"
 keywords = ["subtitle", "video", "rename", "egui", "desktop"]
 categories = ["command-line-utilities", "multimedia"]
 
