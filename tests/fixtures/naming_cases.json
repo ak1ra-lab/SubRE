@@ -1,0 +1,77 @@
+{
+  "cases": [
+    {
+      "name": "death_note_distinct_tracks",
+      "template": "${video}.${group}-${lang}.${ext}",
+      "auto_fill_lang": false,
+      "case_sensitive": false,
+      "mappings": [
+        {"token": "X2&CASO", "value": "华盟字幕社", "var": "group"},
+        {"token": "track3", "value": "zh-Hans", "var": "lang"},
+        {"token": "track4", "value": "zh-Hant", "var": "lang"},
+        {"token": "track5", "value": "jp", "var": "lang"},
+        {"token": "track6", "value": "zh-Hans&jp", "var": "lang"}
+      ],
+      "video_stem": "Death_Note - 01 (BD 1280x720 AVC AAC)",
+      "subtitle_stems": [
+        "[X2&CASO][Death_Note][JP_GB_BIG5][01][DVDRIP][x264_Vorbis][F464D61D]_track3.ass",
+        "[X2&CASO][Death_Note][JP_GB_BIG5][01][DVDRIP][x264_Vorbis][F464D61D]_track4.ass",
+        "[X2&CASO][Death_Note][JP_GB_BIG5][01][DVDRIP][x264_Vorbis][F464D61D]_track5.ass",
+        "[X2&CASO][Death_Note][JP_GB_BIG5][01][DVDRIP][x264_Vorbis][F464D61D]_track6.ass"
+      ],
+      "expected_targets": [
+        "Death_Note - 01 (BD 1280x720 AVC AAC).华盟字幕社-zh-Hans.ass",
+        "Death_Note - 01 (BD 1280x720 AVC AAC).华盟字幕社-zh-Hant.ass",
+        "Death_Note - 01 (BD 1280x720 AVC AAC).华盟字幕社-jp.ass",
+        "Death_Note - 01 (BD 1280x720 AVC AAC).华盟字幕社-zh-Hans&jp.ass"
+      ]
+    },
+    {
+      "name": "cjk_value_in_template",
+      "template": "${video}.${lang}.${ext}",
+      "auto_fill_lang": false,
+      "case_sensitive": false,
+      "mappings": [
+        {"token": "简", "value": "zh-Hans", "var": "lang"}
+      ],
+      "video_stem": "Show.S01E01",
+      "subtitle_stems": ["Show.S01E01.简.ass"],
+      "expected_targets": ["Show.S01E01.zh-Hans.ass"]
+    },
+    {
+      "name": "ampersand_token_with_brackets",
+      "template": "${video}.${group}.${ext}",
+      "auto_fill_lang": false,
+      "case_sensitive": false,
+      "mappings": [
+        {"token": "X2&CASO", "value": "华盟字幕社", "var": "group"}
+      ],
+      "video_stem": "Show",
+      "subtitle_stems": ["[X2&CASO]Show.ass"],
+      "expected_targets": ["Show.华盟字幕社.ass"]
+    },
+    {
+      "name": "longest_token_wins_same_var",
+      "template": "${video}.${lang}.${ext}",
+      "auto_fill_lang": false,
+      "case_sensitive": false,
+      "mappings": [
+        {"token": "track", "value": "short", "var": "lang"},
+        {"token": "track3", "value": "zh-Hans", "var": "lang"}
+      ],
+      "video_stem": "Show",
+      "subtitle_stems": ["Show._track3.ass"],
+      "expected_targets": ["Show.zh-Hans.ass"]
+    },
+    {
+      "name": "empty_var_collapses_separators_via_fixture",
+      "template": "${video}.${group}-${lang}.${ext}",
+      "auto_fill_lang": false,
+      "case_sensitive": false,
+      "mappings": [],
+      "video_stem": "Show - 01",
+      "subtitle_stems": ["Show - 01.ass"],
+      "expected_targets": ["Show - 01.ass"]
+    }
+  ]
+}

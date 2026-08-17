@@ -15,16 +15,6 @@ use serde::{Deserialize, Serialize};
 use super::matcher::{FileEntry, MatchResult};
 use super::parse::{detect_language_alias, find_boundary_token};
 
-/// Persistence scope of a token mapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum MappingScope {
-    /// Persisted in the TOML config; applies across sessions.
-    #[default]
-    Global,
-    /// Persisted in the `SQLite` db; applies to the current batch only.
-    Session,
-}
-
 /// A single "token -> (value, target variable)" mapping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenMapping {
@@ -33,8 +23,6 @@ pub struct TokenMapping {
     /// Template variable this mapping fills; defaults to `lang`.
     #[serde(default = "default_var")]
     pub var: String,
-    #[serde(default)]
-    pub scope: MappingScope,
 }
 
 fn default_var() -> String {
@@ -490,7 +478,6 @@ mod tests {
                 token: "chs".into(),
                 value: "zh-Hans".into(),
                 var: "lang".into(),
-                scope: MappingScope::Global,
             }],
             ..NamingConfig::default()
         };
@@ -513,7 +500,6 @@ mod tests {
                 token: "track3".into(),
                 value: "zh-Hans".into(),
                 var: "lang".into(),
-                scope: MappingScope::Global,
             }],
             ..NamingConfig::default()
         };
@@ -637,12 +623,7 @@ mod tests {
     }
 
     fn mapping(token: &str, value: &str, var: &str) -> TokenMapping {
-        TokenMapping {
-            token: token.into(),
-            value: value.into(),
-            var: var.into(),
-            scope: MappingScope::Global,
-        }
+        TokenMapping { token: token.into(), value: value.into(), var: var.into() }
     }
 
     #[test]

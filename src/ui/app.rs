@@ -27,13 +27,13 @@ use crate::core::execute::{
     ChecksumCache, ExecuteReport, OpOutcome, RollbackItem, RollbackOutcome, execute_plan,
     rollback_unit, sha256_hex,
 };
-use crate::core::history::{HistoryDb, RenameRecord};
 use crate::core::matcher::{FileEntry, MatchResult, Matcher, collect_media_files};
 use crate::core::parse::{ExtensionRegistry, FileCategory};
 use crate::core::plan::{
-    ActionMode, Conflict, MappingScope, NamingConfig, Plan, PlannedAction, PlannedOp, StdFsProbe,
-    TokenMapping, generate_plan,
+    ActionMode, Conflict, NamingConfig, Plan, PlannedAction, PlannedOp, StdFsProbe, TokenMapping,
+    generate_plan,
 };
+use crate::core::state::{RenameRecord, StateDb};
 
 /// Upper bound on the number of status-log lines retained. The log is
 /// append-only; entries past this limit are dropped from the front.
@@ -81,7 +81,7 @@ struct RefreshResult {
 pub struct App {
     pub registry: ExtensionRegistry,
     pub config: UserConfig,
-    pub history: HistoryDb,
+    pub history: StateDb,
 
     pub video_entries: Vec<FileEntry>,
     pub subtitle_entries: Vec<FileEntry>,
@@ -138,12 +138,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: UserConfig, history: HistoryDb) -> Self {
-        let mut config = config;
-        // Merge session-scoped mappings persisted in the db into the config.
-        if let Ok(session) = history.session_mappings() {
-            config.suffix.mappings.extend(session);
-        }
+    pub fn new(config: UserConfig, history: StateDb) -> Self {
         let mut registry = ExtensionRegistry::new();
         for ext in &config.custom_video_exts {
             registry.add_custom_video(ext);
@@ -930,27 +925,6 @@ impl App {
                     if ui.text_edit_singleline(&mut m.var).changed() {
                         edited = true;
                     }
-                    egui::ComboBox::from_id_salt(("scope", i))
-                        .selected_text(match m.scope {
-                            MappingScope::Global => "global",
-                            MappingScope::Session => "session",
-                        })
-                        .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(m.scope == MappingScope::Global, "global")
-                                .clicked()
-                            {
-                                m.scope = MappingScope::Global;
-                                edited = true;
-                            }
-                            if ui
-                                .selectable_label(m.scope == MappingScope::Session, "session")
-                                .clicked()
-                            {
-                                m.scope = MappingScope::Session;
-                                edited = true;
-                            }
-                        });
                     if ui.button("x").clicked() {
                         to_remove = Some(i);
                     }
@@ -968,7 +942,6 @@ impl App {
                     token: String::new(),
                     value: String::new(),
                     var: "lang".into(),
-                    scope: MappingScope::Global,
                 });
                 self.refresh_match_and_plan();
             }
@@ -987,17 +960,9 @@ impl App {
 
     fn save_config(&mut self) {
         let cfg = self.current_config();
-        // Global mappings -> TOML; session mappings -> SQLite.
-        let (global, session): (Vec<TokenMapping>, Vec<TokenMapping>) =
-            cfg.suffix.mappings.iter().cloned().partition(|m| m.scope == MappingScope::Global);
-        let mut toml_cfg = cfg.clone();
-        toml_cfg.suffix.mappings = global;
-        match ConfigStore::save_default(&toml_cfg) {
+        match ConfigStore::save_default(&cfg) {
             Ok(()) => self.config = cfg,
             Err(e) => self.push_status(format!("config save failed: {e}")),
-        }
-        if let Err(e) = self.history.replace_session_mappings(&session) {
-            self.push_status(format!("session mappings save failed: {e}"));
         }
         self.refresh_match_and_plan();
     }

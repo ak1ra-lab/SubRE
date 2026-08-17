@@ -6,17 +6,17 @@
 
 pub mod config;
 pub mod execute;
-pub mod history;
 pub mod matcher;
 pub mod parse;
 pub mod plan;
+pub mod state;
 
 pub use config::{ConfigStore, UserConfig};
 pub use execute::{ExecuteReport, OpOutcome, execute_plan};
-pub use history::{HistoryDb, RenameRecord, SessionRecord};
 pub use matcher::{MatchResult, Matcher, PairGroup};
 pub use parse::{EpisodeKey, ExtensionRegistry, FileCategory, RawKey, extract_keys, normalize_key};
 pub use plan::{
-    ActionMode, Conflict, DEFAULT_TEMPLATE, MappingScope, NamingConfig, Plan, PlannedOp,
-    TokenMapping, generate_plan, render_template,
+    ActionMode, Conflict, DEFAULT_TEMPLATE, NamingConfig, Plan, PlannedOp, TokenMapping,
+    generate_plan, render_template,
 };
+pub use state::{RenameRecord, SessionRecord, StateDb};

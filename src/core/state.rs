@@ -1,4 +1,4 @@
-//! Sqlite-backed history of in-place renames, keyed by file identity.
+//! Application-state persistence: rename history plus session/identity tracking.
 //!
 //! Schema (per design D1):
 //!
@@ -22,8 +22,6 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
-use crate::core::plan::{MappingScope, TokenMapping};
-
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,19 +41,11 @@ CREATE TABLE IF NOT EXISTS renames (
 );
 CREATE INDEX IF NOT EXISTS idx_renames_identity ON renames(dir, checksum, at);
 CREATE INDEX IF NOT EXISTS idx_renames_session ON renames(session_id);
-CREATE TABLE IF NOT EXISTS token_mappings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    token TEXT NOT NULL,
-    value TEXT NOT NULL,
-    var TEXT NOT NULL,
-    scope TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-);
 ";
 
 /// Schema version. Older databases (version < `CURRENT_VERSION`) predate
 /// the checksum/append-only model and are rebuilt from scratch.
-const CURRENT_VERSION: i64 = 2;
+const CURRENT_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
@@ -77,52 +67,78 @@ pub struct RenameRecord {
     pub at: i64,
 }
 
-/// Default database location: `dirs::data_dir()/subtitle-renamer/app.db`.
-pub fn default_db_path() -> PathBuf {
-    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("subtitle-renamer").join("app.db")
+/// Default database location: `dirs::data_dir()/subtitle-renamer/state.db`.
+pub fn default_state_path() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("subtitle-renamer").join("state.db")
 }
 
 #[derive(Debug)]
-pub struct HistoryDb {
+pub struct StateDb {
     conn: Connection,
 }
 
-impl HistoryDb {
+impl StateDb {
     /// Open (or create) the database at `path`, migrating/recreating the
     /// schema as needed.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("create history db parent {}", parent.display()))?;
+                .with_context(|| format!("create state db parent {}", parent.display()))?;
         }
-        let conn = Connection::open(path)
-            .with_context(|| format!("open history db {}", path.display()))?;
+        let conn = Connection::open(Self::resolve_db_path(path)?)
+            .with_context(|| format!("open state db {}", path.display()))?;
         Self::migrate(&conn)?;
-        conn.execute_batch(SCHEMA).context("init history schema")?;
+        conn.execute_batch(SCHEMA).context("init state schema")?;
         Ok(Self { conn })
     }
 
-    /// If the database predates the current schema, drop any legacy
-    /// tables and bump `user_version`. Fresh databases start at version 0
-    /// and receive the current schema for free.
+    /// If `state.db` is missing but a legacy `app.db` exists alongside it,
+    /// rename the legacy file in place so the user's history survives the
+    /// storage rename. If `state.db` already exists, or `app.db` does not
+    /// exist, this is a no-op and `path` is returned unchanged.
+    fn resolve_db_path(path: &Path) -> Result<&Path> {
+        if !path.exists()
+            && let Some(parent) = path.parent()
+        {
+            let legacy = parent.join("app.db");
+            if legacy.exists() {
+                std::fs::rename(&legacy, path).with_context(|| {
+                    format!("migrate legacy db {} -> {}", legacy.display(), path.display())
+                })?;
+            }
+        }
+        Ok(path)
+    }
+
+    /// Bring `conn` up to the current schema, dropping only the tables that
+    /// the current version removes. v0/v1 databases had a different shape
+    /// and are dropped wholesale; v2 only needs `token_mappings` removed.
+    /// Fresh databases (version 0) get the current schema for free.
     fn migrate(conn: &Connection) -> Result<()> {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .context("read user_version")?;
-        if version < CURRENT_VERSION {
+        if version < 2 {
             conn.execute_batch(
                 "DROP TABLE IF EXISTS operations;
                  DROP TABLE IF EXISTS sessions;
                  DROP TABLE IF EXISTS renames;
-                 PRAGMA user_version = 2;",
+                 DROP TABLE IF EXISTS token_mappings;
+                 PRAGMA user_version = 3;",
             )
-            .context("migrate: drop legacy history tables")?;
+            .context("migrate: drop pre-v2 state tables")?;
+        } else if version < CURRENT_VERSION {
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS token_mappings;
+                 PRAGMA user_version = 3;",
+            )
+            .context("migrate: drop v2-only token_mappings")?;
         }
         Ok(())
     }
 
     pub fn open_default() -> Result<Self> {
-        Self::open(&default_db_path())
+        Self::open(&default_state_path())
     }
 
     /// Create a new session and return its id.
@@ -220,38 +236,6 @@ impl HistoryDb {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
-
-    /// Replace all session-scoped token mappings with `mappings`.
-    pub fn replace_session_mappings(&self, mappings: &[TokenMapping]) -> Result<()> {
-        self.conn.execute("DELETE FROM token_mappings WHERE scope = 'session'", [])?;
-        let at = now_epoch();
-        for m in mappings {
-            self.conn.execute(
-                "INSERT INTO token_mappings (token, value, var, scope, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![m.token, m.value, m.var, "session", at],
-            )?;
-        }
-        Ok(())
-    }
-
-    /// All session-scoped token mappings persisted in the db, oldest first.
-    pub fn session_mappings(&self) -> Result<Vec<TokenMapping>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT token, value, var FROM token_mappings WHERE scope = 'session' ORDER BY id ASC",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(TokenMapping {
-                    token: row.get(0)?,
-                    value: row.get(1)?,
-                    var: row.get(2)?,
-                    scope: MappingScope::Session,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
 }
 
 fn row_to_rename(row: &rusqlite::Row<'_>) -> rusqlite::Result<RenameRecord> {
@@ -280,20 +264,20 @@ fn now_epoch() -> i64 {
 mod tests {
     use super::*;
 
-    fn tmp_db() -> (HistoryDb, PathBuf) {
+    fn tmp_db() -> (StateDb, PathBuf) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "sr_hist_{}_{}_{}",
+            "sr_state_{}_{}_{}",
             std::process::id(),
             n,
             std::thread::current().name().unwrap_or("main")
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("history.db");
-        (HistoryDb::open(&path).unwrap(), path)
+        let path = dir.join("state.db");
+        (StateDb::open(&path).unwrap(), path)
     }
 
     #[test]
@@ -379,7 +363,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE operations (id INTEGER PRIMARY KEY);").unwrap();
         drop(conn);
         // Opening should drop `operations` and install the new schema.
-        let db = HistoryDb::open(&path).unwrap();
+        let db = StateDb::open(&path).unwrap();
         let has_operations: i64 = db
             .conn
             .query_row(
@@ -392,6 +376,61 @@ mod tests {
         // And the new tables exist and work.
         let sid = db.create_session(None).unwrap();
         assert!(sid > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_drops_v2_token_mappings_but_preserves_sessions() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "sr_v2_mig_{}_{}_{}",
+            std::process::id(),
+            n,
+            std::thread::current().name().unwrap_or("main")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        // Lay down a v2 database: real `sessions` row plus a vestigial
+        // `token_mappings` table that should be dropped on open.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 created_at INTEGER NOT NULL,
+                 working_dir TEXT,
+                 undo_of INTEGER REFERENCES sessions(id)
+             );
+             CREATE TABLE renames (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id INTEGER NOT NULL REFERENCES sessions(id),
+                 dir TEXT NOT NULL,
+                 checksum TEXT NOT NULL,
+                 unit_id TEXT,
+                 old_name TEXT NOT NULL,
+                 new_name TEXT NOT NULL,
+                 at INTEGER NOT NULL
+             );
+             CREATE TABLE token_mappings (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 token TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 var TEXT NOT NULL,
+                 scope TEXT NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
+             INSERT INTO sessions (id, created_at, working_dir, undo_of)
+                 VALUES (1, 1700000000, '/subs', NULL);
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+        drop(conn);
+        let db = StateDb::open(&path).unwrap();
+        let sessions = db.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1, "v2 session row must survive migration");
+        assert_eq!(sessions[0].working_dir.as_deref(), Some("/subs"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

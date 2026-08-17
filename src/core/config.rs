@@ -74,7 +74,7 @@ impl ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::plan::{MappingScope, TokenMapping};
+    use crate::core::plan::TokenMapping;
 
     #[test]
     fn round_trip_toml() {
@@ -88,7 +88,6 @@ mod tests {
             token: "chs".into(),
             value: "zh-Hans".into(),
             var: "lang".into(),
-            scope: MappingScope::Global,
         });
         cfg.custom_subtitle_exts = vec!["sup".into()];
         ConfigStore::save(&cfg, &path).unwrap();
