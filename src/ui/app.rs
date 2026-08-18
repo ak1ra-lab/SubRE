@@ -6,12 +6,14 @@
 //!     a `📁 Browse (Auto)…` entry (files or folder, auto-classified)
 //!     and a `🗑 Clear all` button at the bottom.
 //!   - `TopBottomPanel::top` (toolbar): `Action:` `ComboBox` on the left,
-//!     `ℹ About` (rightmost), `▶ Apply` (green), `📜 History`, `📋 Copy mv`
+//!     `ℹ About` (rightmost), `▶ Apply` (green), `↩ Undo last`, `📋 Copy mv`
 //!     packed right-to-left.
 //!   - `TopBottomPanel::bottom` (status): scrollable, resizable `status_log`.
-//!   - `CentralPanel`: history hint banner (if any), inline `⚙ Settings`
-//!     collapsing header, three-column `TableBuilder`,
-//!     `Unmatched / unknown` collapsing.
+//!   - `CentralPanel`: tab strip with `Plan (n)` / `History (n)` labels;
+//!     Plan tab body = history hint banner + inline `⚙ Settings` collapsing
+//!     header + three-column `TableBuilder` + `Unmatched / unknown`
+//!     collapsing; History tab body = scope/search/`page_size` filter + session
+//!     list + copies foldout.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -119,6 +121,17 @@ impl Default for HistoryView {
     }
 }
 
+/// Which tab is currently active in the `CentralPanel`. Defaults to `Plan`
+/// and intentionally NOT persisted — restarting the app always lands on
+/// `Plan` (a fresh "back to work" surface, not a stale "I was inspecting
+/// history last" state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActiveTab {
+    #[default]
+    Plan,
+    History,
+}
+
 /// Top-level GUI state.
 #[derive(Debug)]
 pub struct App {
@@ -145,8 +158,11 @@ pub struct App {
 
     // Modal / panel toggles.
     pub show_confirm: bool,
-    pub show_history: bool,
     pub show_about: bool,
+
+    /// Active tab in the `CentralPanel`. Not persisted to config; defaults
+    /// to `Plan` on every launch.
+    pub active_tab: ActiveTab,
 
     /// Initial left-panel width, computed once on the first layout pass
     /// from the available width. `None` until then; egui persists any
@@ -220,8 +236,8 @@ impl App {
                 "Use Browse to load files, or start from a media folder.",
             )],
             show_confirm: false,
-            show_history: false,
             show_about: false,
+            active_tab: ActiveTab::default(),
             sidebar_width: None,
             history_hint: Vec::new(),
             undo_selection: HashMap::new(),
@@ -880,8 +896,6 @@ impl App {
                     self.show_confirm = true;
                 }
 
-                ui.toggle_value(&mut self.show_history, "📜 History");
-
                 if ui.button("↩ Undo last").clicked() {
                     self.undo_last();
                 }
@@ -919,7 +933,27 @@ impl App {
     // Central panel
     // -----------------------------------------------------------------
 
-    fn render_central(&mut self, ui: &mut egui::Ui) {
+    fn render_tab_strip(&mut self, ui: &mut egui::Ui) {
+        let plan_n = self
+            .plan
+            .as_ref()
+            .map_or(0, |p| p.ops.iter().filter(|op| op.conflicts.is_empty()).count());
+        let history_n = self.history.list_sessions().map_or(0, |s| s.len());
+
+        ui.horizontal(|ui| {
+            ui.selectable_label(self.active_tab == ActiveTab::Plan, format!("Plan ({plan_n})"))
+                .clicked()
+                .then(|| self.active_tab = ActiveTab::Plan);
+            ui.selectable_label(
+                self.active_tab == ActiveTab::History,
+                format!("History ({history_n})"),
+            )
+            .clicked()
+            .then(|| self.active_tab = ActiveTab::History);
+        });
+    }
+
+    fn render_plan_tab(&mut self, ui: &mut egui::Ui) {
         for (dir, checksum) in &self.checksum_collision {
             ui.colored_label(
                 egui::Color32::RED,
@@ -1177,10 +1211,10 @@ impl App {
     }
 
     // -----------------------------------------------------------------
-    // History popup
+    // History tab (rendered inside the CentralPanel, not as a modal)
     // -----------------------------------------------------------------
 
-    fn render_history_window(&mut self, ctx: &egui::Context) {
+    fn render_history_tab(&mut self, ui: &mut egui::Ui) {
         let mut scope_dirs: Vec<PathBuf> = self
             .subtitle_entries
             .iter()
@@ -1198,160 +1232,150 @@ impl App {
             self.history_view.scope_current_only = false;
         }
 
-        // Size the popup as a fraction of the main viewport so it stays
-        // proportional on any window size. Falls back to a sensible
-        // default if the viewport hasn't been laid out yet.
-        let viewport = ctx.viewport_rect().size();
-        let win_size = egui::vec2(
-            (viewport.x * 0.65).clamp(768.0, 1280.0),
-            (viewport.y * 0.65).clamp(432.0, 720.0),
-        );
-        egui::Window::new("History").resizable(true).default_size(win_size).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.add_enabled(
-                    !scope_empty,
-                    egui::Checkbox::new(
-                        &mut self.history_view.scope_current_only,
-                        "Current dirs only",
-                    ),
+        ui.horizontal(|ui| {
+            ui.add_enabled(
+                !scope_empty,
+                egui::Checkbox::new(&mut self.history_view.scope_current_only, "Current dirs only"),
+            );
+            if scope_empty {
+                // Use a dark amber (rather than pure YELLOW) so the
+                // hint stays readable in light mode; pure yellow on a
+                // light background washes out.
+                ui.colored_label(
+                    egui::Color32::from_rgb(160, 100, 0),
+                    "No loaded subtitle dirs — showing everything.",
                 );
-                if scope_empty {
-                    // Use a dark amber (rather than pure YELLOW) so the
-                    // hint stays readable in light mode; pure yellow on a
-                    // light background washes out.
-                    ui.colored_label(
-                        egui::Color32::from_rgb(160, 100, 0),
-                        "No loaded subtitle dirs — showing everything.",
-                    );
-                }
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.history_view.search)
-                        .hint_text("search id / dir / filename"),
-                );
-            });
-
-            let session_limit = self.history_view.page_size + self.history_view.show_older_offset;
-            let sessions_all = match self.history.list_sessions() {
-                Ok(s) => s,
-                Err(e) => {
-                    ui.label(format!("history read failed: {e}"));
-                    Vec::new()
-                }
-            };
-            let sessions: Vec<SessionRecord> = sessions_all
-                .iter()
-                .filter(|s| {
-                    session_matches(&self.history, s, &self.history_view, &scope_dirs, scope_empty)
-                })
-                .take(session_limit)
-                .cloned()
-                .collect();
-
-            if sessions.is_empty() {
-                ui.label("(no history yet)");
             }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.history_view.search)
+                    .hint_text("search id / dir / filename"),
+            );
+            egui::ComboBox::from_id_salt("history_page_size")
+                .selected_text(format!("{} / page", self.history_view.page_size))
+                .show_ui(ui, |ui| {
+                    for &n in &[10usize, 20, 50, 100] {
+                        ui.selectable_value(
+                            &mut self.history_view.page_size,
+                            n,
+                            format!("{n} / page"),
+                        );
+                    }
+                });
+        });
 
-            let mut to_undo: Option<i64> = None;
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                for s in &sessions {
-                    let rename_count =
-                        self.history.renames_for_session(s.id).map_or(0, |r| r.len());
-                    let subtitle_dir = s.subtitle_dir.clone().unwrap_or_else(|| "(none)".into());
-                    let title = match s.undo_of {
-                        Some(orig) => format!(
-                            "session #{} — undo of #{} — {} — {} — {} renames",
-                            s.id,
-                            orig,
-                            format_epoch(s.created_at),
-                            subtitle_dir,
-                            rename_count
-                        ),
-                        None => format!(
-                            "session #{} — {} — {} — {} renames",
-                            s.id,
-                            format_epoch(s.created_at),
-                            subtitle_dir,
-                            rename_count
-                        ),
-                    };
-                    ui.collapsing(title, |ui| match self.history.renames_for_session(s.id) {
-                        Ok(renames) => {
-                            let units = group_units(&renames);
-                            if units.is_empty() {
-                                ui.label("(no renames)");
-                            } else {
-                                let selection = self
-                                    .undo_selection
-                                    .entry(s.id)
-                                    .or_insert_with(|| vec![true; units.len()]);
-                                if selection.len() != units.len() {
-                                    selection.resize(units.len(), true);
-                                }
-                                for (i, unit) in units.iter().enumerate() {
-                                    ui.checkbox(&mut selection[i], unit_label(unit));
-                                }
-                                if ui.button("Undo selected").clicked() {
-                                    to_undo = Some(s.id);
-                                }
+        let session_limit = self.history_view.page_size + self.history_view.show_older_offset;
+        let sessions_all = match self.history.list_sessions() {
+            Ok(s) => s,
+            Err(e) => {
+                ui.label(format!("history read failed: {e}"));
+                Vec::new()
+            }
+        };
+        let sessions: Vec<SessionRecord> = sessions_all
+            .iter()
+            .filter(|s| {
+                session_matches(&self.history, s, &self.history_view, &scope_dirs, scope_empty)
+            })
+            .take(session_limit)
+            .cloned()
+            .collect();
+
+        if sessions.is_empty() {
+            ui.label("(no history yet)");
+        }
+
+        let mut to_undo: Option<i64> = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for s in &sessions {
+                let rename_count = self.history.renames_for_session(s.id).map_or(0, |r| r.len());
+                let subtitle_dir = s.subtitle_dir.clone().unwrap_or_else(|| "(none)".into());
+                let title = match s.undo_of {
+                    Some(orig) => format!(
+                        "session #{} — undo of #{} — {} — {} — {} renames",
+                        s.id,
+                        orig,
+                        format_epoch(s.created_at),
+                        subtitle_dir,
+                        rename_count
+                    ),
+                    None => format!(
+                        "session #{} — {} — {} — {} renames",
+                        s.id,
+                        format_epoch(s.created_at),
+                        subtitle_dir,
+                        rename_count
+                    ),
+                };
+                ui.collapsing(title, |ui| match self.history.renames_for_session(s.id) {
+                    Ok(renames) => {
+                        let units = group_units(&renames);
+                        if units.is_empty() {
+                            ui.label("(no renames)");
+                        } else {
+                            let selection = self
+                                .undo_selection
+                                .entry(s.id)
+                                .or_insert_with(|| vec![true; units.len()]);
+                            if selection.len() != units.len() {
+                                selection.resize(units.len(), true);
+                            }
+                            for (i, unit) in units.iter().enumerate() {
+                                ui.checkbox(&mut selection[i], unit_label(unit));
+                            }
+                            if ui.button("Undo selected").clicked() {
+                                to_undo = Some(s.id);
                             }
                         }
-                        Err(e) => {
-                            ui.label(format!("history read failed: {e}"));
-                        }
-                    });
-                }
-            });
-
-            let filtered_total = sessions_all
-                .iter()
-                .filter(|s| {
-                    session_matches(&self.history, s, &self.history_view, &scope_dirs, scope_empty)
-                })
-                .count();
-            let remaining = filtered_total.saturating_sub(session_limit);
-            if remaining > 0 && ui.button(format!("Show older {remaining} more")).clicked() {
-                self.history_view.show_older_offset += self.history_view.page_size;
-            }
-
-            // Copies foldout.
-            let copies = match self.history.copies_in_dirs(&scope_dirs) {
-                Ok(c) => c,
-                Err(e) => {
-                    ui.label(format!("copies read failed: {e}"));
-                    Vec::new()
-                }
-            };
-            let copies_header = format!(
-                "copies ({}) {}",
-                copies.len(),
-                if self.copies_expanded { "▾" } else { "▸" }
-            );
-            if ui.selectable_label(self.copies_expanded, &copies_header).clicked() {
-                self.copies_expanded = !self.copies_expanded;
-            }
-            if self.copies_expanded {
-                for c in &copies {
-                    let cs_short = &c.dst_checksum[..8.min(c.dst_checksum.len())];
-                    ui.label(format!(
-                        "⤴ {}  {}/{} → {}/{}  {}",
-                        format_epoch(c.at),
-                        c.src_dir,
-                        c.src_name,
-                        c.dst_dir,
-                        c.dst_name,
-                        cs_short
-                    ));
-                }
-            }
-
-            if let Some(sid) = to_undo {
-                self.undo_session(sid);
-            }
-
-            if ui.button("Close").clicked() {
-                self.show_history = false;
+                    }
+                    Err(e) => {
+                        ui.label(format!("history read failed: {e}"));
+                    }
+                });
             }
         });
+
+        let filtered_total = sessions_all
+            .iter()
+            .filter(|s| {
+                session_matches(&self.history, s, &self.history_view, &scope_dirs, scope_empty)
+            })
+            .count();
+        let remaining = filtered_total.saturating_sub(session_limit);
+        if remaining > 0 && ui.button(format!("Show older {remaining} more")).clicked() {
+            self.history_view.show_older_offset += self.history_view.page_size;
+        }
+
+        // Copies foldout.
+        let copies = match self.history.copies_in_dirs(&scope_dirs) {
+            Ok(c) => c,
+            Err(e) => {
+                ui.label(format!("copies read failed: {e}"));
+                Vec::new()
+            }
+        };
+        let copies_header =
+            format!("copies ({}) {}", copies.len(), if self.copies_expanded { "▾" } else { "▸" });
+        if ui.selectable_label(self.copies_expanded, &copies_header).clicked() {
+            self.copies_expanded = !self.copies_expanded;
+        }
+        if self.copies_expanded {
+            for c in &copies {
+                let cs_short = &c.dst_checksum[..8.min(c.dst_checksum.len())];
+                ui.label(format!(
+                    "⤴ {}  {}/{} → {}/{}  {}",
+                    format_epoch(c.at),
+                    c.src_dir,
+                    c.src_name,
+                    c.dst_dir,
+                    c.dst_name,
+                    cs_short
+                ));
+            }
+        }
+
+        if let Some(sid) = to_undo {
+            self.undo_session(sid);
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1391,11 +1415,6 @@ impl App {
                     }
                 },
             );
-        }
-
-        // History window.
-        if self.show_history {
-            self.render_history_window(ctx);
         }
 
         // About window.
@@ -1683,9 +1702,14 @@ impl eframe::App for App {
                 self.render_status_bar(ui);
             });
 
-        // Central panel — history hint, settings, table, unmatched.
+        // Central panel — tab strip + active tab body (Plan or History).
         egui::CentralPanel::default().show(ui, |ui| {
-            self.render_central(ui);
+            self.render_tab_strip(ui);
+            ui.separator();
+            match self.active_tab {
+                ActiveTab::Plan => self.render_plan_tab(ui),
+                ActiveTab::History => self.render_history_tab(ui),
+            }
         });
 
         // Modals live on ctx so they survive panel restructuring.
