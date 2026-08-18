@@ -16,7 +16,7 @@ pub use execute::{ExecuteReport, OpOutcome, execute_plan};
 pub use matcher::{MatchResult, Matcher, PairGroup};
 pub use parse::{EpisodeKey, ExtensionRegistry, FileCategory, RawKey, extract_keys, normalize_key};
 pub use plan::{
-    ActionMode, Conflict, DEFAULT_TEMPLATE, NamingConfig, Plan, PlannedOp, TokenMapping,
+    ActionMode, Conflict, DEFAULT_TEMPLATE, NamingConfig, Plan, PlanError, PlannedOp, TokenMapping,
     generate_plan, render_template,
 };
-pub use state::{RenameRecord, SessionRecord, StateDb};
+pub use state::{CopyRecord, RenameRecord, SessionRecord, StateDb};

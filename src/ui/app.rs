@@ -33,7 +33,7 @@ use crate::core::plan::{
     ActionMode, Conflict, NamingConfig, Plan, PlannedAction, PlannedOp, StdFsProbe, TokenMapping,
     generate_plan,
 };
-use crate::core::state::{RenameRecord, StateDb};
+use crate::core::state::{CopyRecord, RenameRecord, SessionRecord, StateDb};
 
 /// Upper bound on the number of status-log lines retained. The log is
 /// append-only; entries past this limit are dropped from the front.
@@ -74,6 +74,49 @@ struct RefreshResult {
     plan: Plan,
     /// Per-subtitle `(dir, checksum)` identities for history attribution.
     identities: Vec<(PathBuf, String)>,
+    /// Plan-generation error (e.g. `Copy` mode without paired videos). When
+    /// `Some`, the plan is empty and the error is surfaced to the user.
+    error: Option<String>,
+}
+
+/// One entry on the combined rename + copy timeline shown in the drag-in
+/// hint. Sorted by `at()`.
+#[derive(Debug, Clone)]
+pub enum TimelineEntry {
+    Rename(RenameRecord),
+    Copy(CopyRecord),
+}
+
+impl TimelineEntry {
+    pub fn at(&self) -> i64 {
+        match self {
+            TimelineEntry::Rename(r) => r.at,
+            TimelineEntry::Copy(c) => c.at,
+        }
+    }
+}
+
+/// Transient view state for the History popup. `scope_current_only`,
+/// `search` and `show_older_offset` are intentionally NOT persisted across
+/// popup close/open: they are query parameters, not preferences. Only the
+/// matching `copies_expanded` toggle on `App` survives.
+#[derive(Debug, Clone)]
+pub struct HistoryView {
+    pub scope_current_only: bool,
+    pub search: String,
+    pub page_size: usize,
+    pub show_older_offset: usize,
+}
+
+impl Default for HistoryView {
+    fn default() -> Self {
+        Self {
+            scope_current_only: true,
+            search: String::new(),
+            page_size: 20,
+            show_older_offset: 0,
+        }
+    }
 }
 
 /// Top-level GUI state.
@@ -110,15 +153,17 @@ pub struct App {
     /// user-dragged width for the rest of the session.
     sidebar_width: Option<f32>,
 
-    // User-selected action policy: Auto (D5 default) or Copy (always
-    // preserve originals). Persisted in the config so it survives restart.
+    // User-selected action policy: `Rename` (default after v3 → v4 migration)
+    // or `Copy`. Persisted in the config so it survives restart.
     pub action_mode: ActionMode,
 
     /// Keep the window always on top. Persisted in the config.
     pub always_on_top: bool,
 
-    // History hint banner (checksum-based provenance).
-    pub history_hint: Vec<RenameRecord>,
+    // History hint banner (checksum-based provenance) — combined rename +
+    // copy timeline per the `(dir, checksum)` identities of the currently
+    // dropped subtitles.
+    pub history_hint: Vec<TimelineEntry>,
 
     /// Per-session undo selection: session id -> per-unit selected flags.
     pub undo_selection: HashMap<i64, Vec<bool>>,
@@ -126,6 +171,13 @@ pub struct App {
     /// Ambiguous `(dir, checksum)` identities detected on the subtitle
     /// side (content collision), for which history is not attributed.
     pub checksum_collision: Vec<(PathBuf, String)>,
+
+    /// Transient view state for the History popup (not persisted).
+    pub history_view: HistoryView,
+
+    /// Whether the History popup's copies fold-out is expanded. Persisted
+    /// across popup close/open — this is a real preference.
+    pub copies_expanded: bool,
 
     // Async refresh plumbing.
     refresh_tx: mpsc::Sender<RefreshRequest>,
@@ -174,6 +226,8 @@ impl App {
             history_hint: Vec::new(),
             undo_selection: HashMap::new(),
             checksum_collision: Vec::new(),
+            history_view: HistoryView::default(),
+            copies_expanded: false,
             refresh_tx,
             refresh_rx,
             refresh_epoch: 0,
@@ -294,6 +348,13 @@ impl App {
 
     /// Commit a completed refresh result to the UI state.
     fn apply_refresh_result(&mut self, res: RefreshResult) {
+        if let Some(err) = res.error {
+            self.plan = Some(Plan::default());
+            self.match_result = Some(res.result);
+            self.apply_history_hint(res.identities);
+            self.push_status(format!("Plan error: {err}"));
+            return;
+        }
         self.match_result = Some(res.result);
         self.plan = Some(res.plan);
         self.apply_history_hint(res.identities);
@@ -307,7 +368,10 @@ impl App {
     /// Rebuild the drag-in history hint and collision warnings from the
     /// per-subtitle `(dir, checksum)` identities computed by the worker:
     /// look up each identity's naming history, flagging same-dir duplicates
-    /// (content collisions) and excluding them from attribution.
+    /// (content collisions) and excluding them from attribution. Each
+    /// identity pulls both rename hits (via [`StateDb::timeline_for`]) and
+    /// copy hits (via [`StateDb::copies_for_identity`]); the combined
+    /// timeline is sorted by `at` ascending.
     fn apply_history_hint(&mut self, identities: Vec<(PathBuf, String)>) {
         self.history_hint.clear();
         self.checksum_collision.clear();
@@ -320,14 +384,20 @@ impl App {
             counts.into_iter().filter(|(_, n)| *n > 1).map(|(k, _)| k).collect();
         self.checksum_collision = ambiguous.iter().cloned().collect();
 
+        let mut entries: Vec<TimelineEntry> = Vec::new();
         for (dir, cs) in identities {
             if ambiguous.contains(&(dir.clone(), cs.clone())) {
                 continue;
             }
             if let Ok(hits) = self.history.timeline_for(&dir, &cs) {
-                self.history_hint.extend(hits);
+                entries.extend(hits.into_iter().map(TimelineEntry::Rename));
+            }
+            if let Ok(hits) = self.history.copies_for_identity(&dir, &cs) {
+                entries.extend(hits.into_iter().map(TimelineEntry::Copy));
             }
         }
+        entries.sort_by_key(TimelineEntry::at);
+        self.history_hint = entries;
     }
 
     fn current_naming_config(&self) -> NamingConfig {
@@ -358,6 +428,12 @@ impl App {
 
     /// Apply the current plan. Synchronous, but errors per op are
     /// collected into a report rather than aborting the whole run.
+    ///
+    /// Rename ops are grouped by their (normalized) `subtitle.path.parent()`
+    /// directory; each group gets a dedicated session, lazily created on
+    /// the first successful rename. Copy ops are appended to the `copies`
+    /// log directly and create no session, so a pure-copy apply leaves no
+    /// session rows behind.
     pub fn apply(&mut self) {
         if self.refresh_pending {
             self.push_status("处理中,请稍候再执行。");
@@ -370,27 +446,23 @@ impl App {
                 return;
             }
         };
-        // Find the working directory for the session record (parent of
-        // first video, or cwd if no videos).
-        let working_dir = self
-            .video_entries
-            .first()
-            .and_then(|v| v.path.parent().map(std::path::Path::to_path_buf));
-
-        let session_id = match self.history.create_session(working_dir.as_deref()) {
-            Ok(id) => id,
-            Err(e) => {
-                self.push_status(format!("history session failed: {e}"));
-                return;
-            }
-        };
 
         let mut report = ExecuteReport::default();
+        let mut session_ids: HashMap<PathBuf, i64> = HashMap::new();
+
         for op in &plan.ops {
-            // Only renames produce a history row; copy leaves the source
-            // untouched and is not recorded. Hash before mutating the
-            // filesystem so the recorded identity matches the pre-rename
-            // content.
+            if matches!(op.action, PlannedAction::Copy) && op.video.is_none() {
+                report.outcomes.push(OpOutcome {
+                    op_index: report.outcomes.len(),
+                    success: false,
+                    error: Some("Copy mode requires paired video".to_string()),
+                    src_path: op.subtitle.path.clone(),
+                    dst_path: op.target_path.clone(),
+                    action: op.action,
+                });
+                continue;
+            }
+
             let checksum = if matches!(op.action, PlannedAction::Rename) {
                 match sha256_hex(&op.subtitle.path) {
                     Ok(c) => Some(c),
@@ -412,10 +484,54 @@ impl App {
 
             match execute_plan(&Plan { ops: vec![op.clone()] }) {
                 Ok(r) => {
-                    if r.all_ok()
-                        && let Some(checksum) = &checksum
-                    {
-                        self.record_rename_for_op(session_id, op, checksum);
+                    if r.all_ok() {
+                        match op.action {
+                            PlannedAction::Rename => {
+                                if let Some(checksum) = &checksum {
+                                    let sub_dir = op.subtitle.path.parent().map_or_else(
+                                        || PathBuf::from("."),
+                                        |p| {
+                                            let key = normalize_dir(p);
+                                            if key != p {
+                                                normalize_dir_warn(
+                                                    p,
+                                                    &std::io::Error::other("non-canonical path"),
+                                                    |m| self.push_status(m),
+                                                );
+                                            }
+                                            key
+                                        },
+                                    );
+                                    let sid = match session_ids.get(&sub_dir) {
+                                        Some(&id) => id,
+                                        None => match self.history.create_session(Some(&sub_dir)) {
+                                            Ok(id) => {
+                                                session_ids.insert(sub_dir.clone(), id);
+                                                id
+                                            }
+                                            Err(e) => {
+                                                self.push_status(format!(
+                                                    "history session failed: {e}"
+                                                ));
+                                                report.outcomes.push(OpOutcome {
+                                                    op_index: report.outcomes.len(),
+                                                    success: false,
+                                                    error: Some(e.to_string()),
+                                                    src_path: op.subtitle.path.clone(),
+                                                    dst_path: op.target_path.clone(),
+                                                    action: op.action,
+                                                });
+                                                continue;
+                                            }
+                                        },
+                                    };
+                                    self.record_rename_for_op(sid, op, checksum);
+                                }
+                            }
+                            PlannedAction::Copy => {
+                                self.record_copy_for_op(op);
+                            }
+                        }
                     }
                     report.outcomes.extend(r.outcomes);
                 }
@@ -460,6 +576,69 @@ impl App {
         }
     }
 
+    /// Record a successful copy op as a `copies` log row (no session).
+    fn record_copy_for_op(&mut self, op: &PlannedOp) {
+        let Some(src_dir) = op.subtitle.path.parent() else {
+            return;
+        };
+        let Some(src_name) = op.subtitle.path.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        let Some(dst_dir) = op.target_path.parent() else {
+            return;
+        };
+        let Some(dst_name) = op.target_path.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        let src_cs = match sha256_hex(&op.subtitle.path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.push_status(format!("copy src checksum failed: {e}"));
+                return;
+            }
+        };
+        let dst_cs = match sha256_hex(&op.target_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.push_status(format!("copy dst checksum failed: {e}"));
+                return;
+            }
+        };
+        if let Err(e) = self.history.record_copy(
+            None,
+            src_dir,
+            src_name,
+            &src_cs,
+            dst_dir,
+            dst_name,
+            &dst_cs,
+            op.unit_id.as_deref(),
+        ) {
+            self.push_status(format!("history write failed: {e}"));
+        }
+    }
+
+    /// Roll back the most recent rename-bearing session, or no-op if none.
+    /// Pure copy sessions have no `renames` rows so the `find` filter skips
+    /// them automatically. Reducing an undo session naturally serves as a
+    /// redo, so the same code path handles both directions.
+    pub fn undo_last(&mut self) {
+        let sessions = match self.history.list_sessions() {
+            Ok(s) => s,
+            Err(e) => {
+                self.push_status(format!("history read failed: {e}"));
+                return;
+            }
+        };
+        let target = sessions
+            .into_iter()
+            .find(|s| self.history.renames_for_session(s.id).is_ok_and(|r| !r.is_empty()));
+        match target {
+            Some(s) => self.undo_session(s.id),
+            None => self.push_status("Nothing to undo."),
+        }
+    }
+
     /// Undo an entire session by id.
     pub fn undo_session(&mut self, session_id: i64) {
         if self.refresh_pending {
@@ -487,7 +666,7 @@ impl App {
             stored.clone()
         };
 
-        let undo_session = match self.history.create_undo_session(session_id, None) {
+        let undo_session = match self.history.create_undo_session(session_id) {
             Ok(id) => id,
             Err(e) => {
                 self.push_status(format!("history undo session failed: {e}"));
@@ -651,15 +830,19 @@ impl App {
             ui.label("Action:");
             egui::ComboBox::from_id_salt("action_mode")
                 .selected_text(match self.action_mode {
-                    ActionMode::Auto => "Auto",
-                    ActionMode::Copy => "Always Copy",
+                    ActionMode::Rename => "Rename",
+                    ActionMode::Copy => "Copy",
                 })
                 .show_ui(ui, |ui| {
                     if ui
-                        .selectable_label(matches!(self.action_mode, ActionMode::Auto), "Auto (D5)")
+                        .selectable_label(
+                            matches!(self.action_mode, ActionMode::Rename),
+                            "Rename (in-place)",
+                        )
+                        .on_hover_text("Rename subtitles inside their own directory.")
                         .clicked()
                     {
-                        self.action_mode = ActionMode::Auto;
+                        self.action_mode = ActionMode::Rename;
                         self.refresh_match_and_plan();
                     }
                     if ui
@@ -698,6 +881,10 @@ impl App {
                 }
 
                 ui.toggle_value(&mut self.show_history, "📜 History");
+
+                if ui.button("↩ Undo last").clicked() {
+                    self.undo_last();
+                }
 
                 if ui
                     .add_enabled(can_apply, egui::Button::new("📋 Copy mv"))
@@ -752,6 +939,28 @@ impl App {
                     self.history_hint.len()
                 ),
             );
+            for entry in &self.history_hint {
+                match entry {
+                    TimelineEntry::Rename(r) => {
+                        ui.label(format!(
+                            "⟳ renamed {} → {} ({})",
+                            r.old_name,
+                            r.new_name,
+                            format_epoch(r.at)
+                        ));
+                    }
+                    TimelineEntry::Copy(c) => {
+                        ui.label(format!(
+                            "⤴ copied {}/{} → {}/{} ({})",
+                            c.src_dir,
+                            c.src_name,
+                            c.dst_dir,
+                            c.dst_name,
+                            format_epoch(c.at)
+                        ));
+                    }
+                }
+            }
         }
 
         self.render_settings(ui);
@@ -968,6 +1177,184 @@ impl App {
     }
 
     // -----------------------------------------------------------------
+    // History popup
+    // -----------------------------------------------------------------
+
+    fn render_history_window(&mut self, ctx: &egui::Context) {
+        let mut scope_dirs: Vec<PathBuf> = self
+            .subtitle_entries
+            .iter()
+            .filter_map(|e| e.path.parent().map(normalize_dir))
+            .collect();
+        scope_dirs.sort();
+        scope_dirs.dedup();
+
+        let scope_empty = scope_dirs.is_empty();
+        // When the sidebar holds nothing, force `scope_current_only = false`
+        // for this render so the user sees everything (and the checkbox is
+        // unchecked). The transient field is reset to default on next
+        // open anyway.
+        if scope_empty {
+            self.history_view.scope_current_only = false;
+        }
+
+        // Size the popup as a fraction of the main viewport so it stays
+        // proportional on any window size. Falls back to a sensible
+        // default if the viewport hasn't been laid out yet.
+        let viewport = ctx.viewport_rect().size();
+        let win_size = egui::vec2(
+            (viewport.x * 0.65).clamp(768.0, 1280.0),
+            (viewport.y * 0.65).clamp(432.0, 720.0),
+        );
+        egui::Window::new("History").resizable(true).default_size(win_size).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_enabled(
+                    !scope_empty,
+                    egui::Checkbox::new(
+                        &mut self.history_view.scope_current_only,
+                        "Current dirs only",
+                    ),
+                );
+                if scope_empty {
+                    // Use a dark amber (rather than pure YELLOW) so the
+                    // hint stays readable in light mode; pure yellow on a
+                    // light background washes out.
+                    ui.colored_label(
+                        egui::Color32::from_rgb(160, 100, 0),
+                        "No loaded subtitle dirs — showing everything.",
+                    );
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.history_view.search)
+                        .hint_text("search id / dir / filename"),
+                );
+            });
+
+            let session_limit = self.history_view.page_size + self.history_view.show_older_offset;
+            let sessions_all = match self.history.list_sessions() {
+                Ok(s) => s,
+                Err(e) => {
+                    ui.label(format!("history read failed: {e}"));
+                    Vec::new()
+                }
+            };
+            let sessions: Vec<SessionRecord> = sessions_all
+                .iter()
+                .filter(|s| {
+                    session_matches(&self.history, s, &self.history_view, &scope_dirs, scope_empty)
+                })
+                .take(session_limit)
+                .cloned()
+                .collect();
+
+            if sessions.is_empty() {
+                ui.label("(no history yet)");
+            }
+
+            let mut to_undo: Option<i64> = None;
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                for s in &sessions {
+                    let rename_count =
+                        self.history.renames_for_session(s.id).map_or(0, |r| r.len());
+                    let subtitle_dir = s.subtitle_dir.clone().unwrap_or_else(|| "(none)".into());
+                    let title = match s.undo_of {
+                        Some(orig) => format!(
+                            "session #{} — undo of #{} — {} — {} — {} renames",
+                            s.id,
+                            orig,
+                            format_epoch(s.created_at),
+                            subtitle_dir,
+                            rename_count
+                        ),
+                        None => format!(
+                            "session #{} — {} — {} — {} renames",
+                            s.id,
+                            format_epoch(s.created_at),
+                            subtitle_dir,
+                            rename_count
+                        ),
+                    };
+                    ui.collapsing(title, |ui| match self.history.renames_for_session(s.id) {
+                        Ok(renames) => {
+                            let units = group_units(&renames);
+                            if units.is_empty() {
+                                ui.label("(no renames)");
+                            } else {
+                                let selection = self
+                                    .undo_selection
+                                    .entry(s.id)
+                                    .or_insert_with(|| vec![true; units.len()]);
+                                if selection.len() != units.len() {
+                                    selection.resize(units.len(), true);
+                                }
+                                for (i, unit) in units.iter().enumerate() {
+                                    ui.checkbox(&mut selection[i], unit_label(unit));
+                                }
+                                if ui.button("Undo selected").clicked() {
+                                    to_undo = Some(s.id);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            ui.label(format!("history read failed: {e}"));
+                        }
+                    });
+                }
+            });
+
+            let filtered_total = sessions_all
+                .iter()
+                .filter(|s| {
+                    session_matches(&self.history, s, &self.history_view, &scope_dirs, scope_empty)
+                })
+                .count();
+            let remaining = filtered_total.saturating_sub(session_limit);
+            if remaining > 0 && ui.button(format!("Show older {remaining} more")).clicked() {
+                self.history_view.show_older_offset += self.history_view.page_size;
+            }
+
+            // Copies foldout.
+            let copies = match self.history.copies_in_dirs(&scope_dirs) {
+                Ok(c) => c,
+                Err(e) => {
+                    ui.label(format!("copies read failed: {e}"));
+                    Vec::new()
+                }
+            };
+            let copies_header = format!(
+                "copies ({}) {}",
+                copies.len(),
+                if self.copies_expanded { "▾" } else { "▸" }
+            );
+            if ui.selectable_label(self.copies_expanded, &copies_header).clicked() {
+                self.copies_expanded = !self.copies_expanded;
+            }
+            if self.copies_expanded {
+                for c in &copies {
+                    let cs_short = &c.dst_checksum[..8.min(c.dst_checksum.len())];
+                    ui.label(format!(
+                        "⤴ {}  {}/{} → {}/{}  {}",
+                        format_epoch(c.at),
+                        c.src_dir,
+                        c.src_name,
+                        c.dst_dir,
+                        c.dst_name,
+                        cs_short
+                    ));
+                }
+            }
+
+            if let Some(sid) = to_undo {
+                self.undo_session(sid);
+            }
+
+            if ui.button("Close").clicked() {
+                self.show_history = false;
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------
     // Modal windows
     // -----------------------------------------------------------------
 
@@ -1008,66 +1395,7 @@ impl App {
 
         // History window.
         if self.show_history {
-            egui::Window::new("History")
-                .resizable(true)
-                .default_size(egui::vec2(600.0, 400.0))
-                .show(ctx, |ui| {
-                    let sessions = match self.history.list_sessions() {
-                        Ok(s) => s,
-                        Err(e) => {
-                            ui.label(format!("history read failed: {e}"));
-                            Vec::new()
-                        }
-                    };
-                    if sessions.is_empty() {
-                        ui.label("(no history yet)");
-                    }
-                    let mut to_undo: Option<i64> = None;
-                    for s in &sessions {
-                        let title = match s.undo_of {
-                            Some(orig) => format!(
-                                "session #{} — {} (undo of #{})",
-                                s.id,
-                                format_epoch(s.created_at),
-                                orig
-                            ),
-                            None => {
-                                format!("session #{} — {}", s.id, format_epoch(s.created_at))
-                            }
-                        };
-                        ui.collapsing(title, |ui| match self.history.renames_for_session(s.id) {
-                            Ok(renames) => {
-                                let units = group_units(&renames);
-                                if units.is_empty() {
-                                    ui.label("(no renames — copy-only session)");
-                                } else {
-                                    let selection = self
-                                        .undo_selection
-                                        .entry(s.id)
-                                        .or_insert_with(|| vec![true; units.len()]);
-                                    if selection.len() != units.len() {
-                                        selection.resize(units.len(), true);
-                                    }
-                                    for (i, unit) in units.iter().enumerate() {
-                                        ui.checkbox(&mut selection[i], unit_label(unit));
-                                    }
-                                    if ui.button("Undo selected").clicked() {
-                                        to_undo = Some(s.id);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                ui.label(format!("history read failed: {e}"));
-                            }
-                        });
-                    }
-                    if let Some(sid) = to_undo {
-                        self.undo_session(sid);
-                    }
-                    if ui.button("Close").clicked() {
-                        self.show_history = false;
-                    }
-                });
+            self.render_history_window(ctx);
         }
 
         // About window.
@@ -1096,6 +1424,69 @@ impl App {
 // Module-level helpers
 // ---------------------------------------------------------------------------
 
+/// Best-effort canonicalization of a directory path. Falls back to
+/// `std::path::absolute` then to the input unchanged so that callers
+/// still get a deterministic key for grouping, even when the directory
+/// has been removed or the platform doesn't support symlink resolution.
+pub fn normalize_dir(p: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(p) {
+        return canon;
+    }
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Push a `normalize_dir` failure warning exactly once. The closure is
+/// passed the warning message so the caller can route it into its own
+/// status log without taking `&mut App`.
+pub fn normalize_dir_warn<F>(p: &Path, e: &std::io::Error, push: F)
+where
+    F: FnOnce(String),
+{
+    push(format!("normalize_dir failed for {}: {e}", p.display()));
+}
+
+/// Scope + search predicate shared between the page-render and the
+/// "`filtered_total`" count. Pure function; takes a `&StateDb` so it can
+/// dereference session renames for the search-narrow step without owning
+/// `App`.
+fn session_matches(
+    db: &crate::core::state::StateDb,
+    s: &crate::core::state::SessionRecord,
+    view: &HistoryView,
+    scope_dirs: &[PathBuf],
+    scope_empty: bool,
+) -> bool {
+    if view.scope_current_only
+        && !scope_empty
+        && let Some(dir) = &s.subtitle_dir
+    {
+        let canon = normalize_dir(Path::new(dir));
+        if !scope_dirs.iter().any(|d| d == &canon) {
+            return false;
+        }
+    }
+    let needle = view.search.trim().to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    if s.id.to_string().contains(&needle) {
+        return true;
+    }
+    if let Some(dir) = &s.subtitle_dir
+        && dir.to_lowercase().contains(&needle)
+    {
+        return true;
+    }
+    if let Ok(renames) = db.renames_for_session(s.id) {
+        renames.iter().any(|r| {
+            r.old_name.to_lowercase().contains(&needle)
+                || r.new_name.to_lowercase().contains(&needle)
+        })
+    } else {
+        false
+    }
+}
+
 /// Spawn the single background refresh worker. Returns the request sender
 /// (owned by `App`) and the result receiver (also owned by `App`). The
 /// worker owns a [`ChecksumCache`] so unchanged subtitles are hashed only
@@ -1112,7 +1503,6 @@ fn spawn_refresh_worker() -> (mpsc::Sender<RefreshRequest>, mpsc::Receiver<Refre
                 req.video_regex.as_deref(),
                 req.subtitle_regex.as_deref(),
             );
-            let plan = generate_plan(&result, &req.naming, &StdFsProbe, req.action_mode);
             let mut identities = Vec::new();
             for sub in &req.subtitles {
                 if let Some(dir) = sub.path.parent()
@@ -1121,7 +1511,23 @@ fn spawn_refresh_worker() -> (mpsc::Sender<RefreshRequest>, mpsc::Receiver<Refre
                     identities.push((dir.to_path_buf(), cs));
                 }
             }
-            if res_tx.send(RefreshResult { epoch: req.epoch, result, plan, identities }).is_err() {
+            let plan = match generate_plan(&result, &req.naming, &StdFsProbe, req.action_mode) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = res_tx.send(RefreshResult {
+                        epoch: req.epoch,
+                        result,
+                        plan: Plan::default(),
+                        identities,
+                        error: Some(e.to_string()),
+                    });
+                    continue;
+                }
+            };
+            if res_tx
+                .send(RefreshResult { epoch: req.epoch, result, plan, identities, error: None })
+                .is_err()
+            {
                 break;
             }
         }

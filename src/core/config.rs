@@ -114,7 +114,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        for &mode in &[ActionMode::Auto, ActionMode::Copy] {
+        for &mode in &[ActionMode::Rename, ActionMode::Copy] {
             let cfg = UserConfig { action_mode: mode, ..UserConfig::default() };
             ConfigStore::save(&cfg, &path).unwrap();
             let loaded = ConfigStore::load(&path).unwrap();
@@ -124,15 +124,21 @@ mod tests {
     }
 
     #[test]
-    fn action_mode_move_degrades_to_auto() {
+    fn action_mode_legacy_strings_map_to_rename() {
         use crate::core::plan::ActionMode;
-        let dir = std::env::temp_dir().join(format!("sr_cfg_move_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sr_cfg_legacy_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        std::fs::write(&path, "action_mode = \"Move\"\n").unwrap();
-        let loaded = ConfigStore::load(&path).unwrap();
-        assert_eq!(loaded.action_mode, ActionMode::Auto);
+        for (raw, expected) in [
+            (r#"action_mode = "Move""#, ActionMode::Rename),
+            (r#"action_mode = "Auto""#, ActionMode::Rename),
+            (r#"action_mode = "Copy""#, ActionMode::Copy),
+        ] {
+            std::fs::write(&path, raw).unwrap();
+            let loaded = ConfigStore::load(&path).unwrap();
+            assert_eq!(loaded.action_mode, expected);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

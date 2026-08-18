@@ -248,8 +248,9 @@ mod tests {
             &r,
             &NamingConfig::default(),
             &NoExists,
-            crate::core::plan::ActionMode::Auto,
-        );
+            crate::core::plan::ActionMode::Rename,
+        )
+        .unwrap();
         let report = execute_plan(&plan).unwrap();
         assert!(report.all_ok());
         assert!(dir.join("Show - 01.ass").exists());
@@ -276,8 +277,9 @@ mod tests {
             &r,
             &NamingConfig::default(),
             &NoExists,
-            crate::core::plan::ActionMode::Auto,
-        );
+            crate::core::plan::ActionMode::Copy,
+        )
+        .unwrap();
         let report = execute_plan(&plan).unwrap();
         assert!(report.all_ok());
         assert!(videos.join("Show - 01.ass").exists());

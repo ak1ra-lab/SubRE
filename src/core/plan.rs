@@ -190,19 +190,16 @@ pub enum Conflict {
     ActionUnsupported(PathBuf),
 }
 
-/// User-selectable policy for how a plan should translate cross-directory
-/// pairings into filesystem operations.
-///
-/// The default (`Auto`) follows design D5: same directory → rename in
-/// place; different directory → copy (preserve originals). Other modes
-/// override that policy uniformly.
+/// User-selectable policy: `Rename` = in-place rename in `subtitle_dir`;
+/// `Copy` = copy to `video_dir`, source untouched. Default after migration
+/// from v3's `Auto` is `Rename` (the safer cross-directory choice).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub enum ActionMode {
-    /// Same-dir Rename, cross-dir Copy. Honors design D5. **Default.**
+    /// In-place rename inside the subtitle's directory. **Default.**
     #[default]
-    Auto,
-    /// Always Copy — never touch the source file. Safe even across
-    /// filesystems.
+    Rename,
+    /// Copy the source to the video's directory, leaving the source
+    /// untouched. Safe even across filesystems.
     Copy,
 }
 
@@ -217,7 +214,7 @@ impl<'de> Deserialize<'de> for ActionMode {
             type Value = ActionMode;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("`Auto` or `Copy` (legacy `Move` maps to `Auto`)")
+                formatter.write_str("`Rename` or `Copy` (legacy `Auto`/`Move` map to `Rename`)")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -225,9 +222,8 @@ impl<'de> Deserialize<'de> for ActionMode {
                 E: serde::de::Error,
             {
                 match value {
+                    "Rename" | "Auto" | "Move" => Ok(ActionMode::Rename),
                     "Copy" => Ok(ActionMode::Copy),
-                    // `Auto` and legacy `Move` both resolve to the default.
-                    "Auto" | "Move" => Ok(ActionMode::Auto),
                     other => Err(E::custom(format!("unknown action mode `{other}`"))),
                 }
             }
@@ -236,6 +232,26 @@ impl<'de> Deserialize<'de> for ActionMode {
         deserializer.deserialize_str(Visitor)
     }
 }
+
+/// Errors emitted by [`generate_plan`].
+#[derive(Debug)]
+pub enum PlanError {
+    /// `Copy` mode requires a paired video to derive the target directory.
+    /// `op_index` indexes into `Plan::ops`.
+    NoVideoForCopy { op_index: usize },
+}
+
+impl std::fmt::Display for PlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlanError::NoVideoForCopy { op_index } => {
+                write!(f, "Copy mode requires paired video (op #{op_index})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PlanError {}
 
 /// A complete plan.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -276,7 +292,7 @@ pub fn generate_plan(
     naming: &NamingConfig,
     probe: &dyn FsProbe,
     action_mode: ActionMode,
-) -> Plan {
+) -> Result<Plan, PlanError> {
     let mut ops = Vec::new();
 
     // Group subtitles by stem-base so .idx + .sub share the same unit.
@@ -318,28 +334,26 @@ pub fn generate_plan(
                 let vars = naming.resolve_vars(sub);
                 let target_basename =
                     render_template(naming.effective_template(), &vars, &video_main, &sub.ext);
-                let target_dir = video.as_ref().and_then(|v| v.path.parent()).map_or_else(
-                    || sub.path.parent().map(std::path::Path::to_path_buf).unwrap_or_default(),
-                    std::path::Path::to_path_buf,
-                );
+                let target_dir = match action_mode {
+                    ActionMode::Rename => {
+                        sub.path.parent().map(std::path::Path::to_path_buf).unwrap_or_default()
+                    }
+                    ActionMode::Copy => match video.as_ref().and_then(|v| v.path.parent()) {
+                        Some(d) => d.to_path_buf(),
+                        None => {
+                            return Err(PlanError::NoVideoForCopy { op_index: ops.len() });
+                        }
+                    },
+                };
                 let target_path = target_dir.join(&target_basename);
 
-                // Pick the action based on the user's mode and the
-                // src/target directory relationship.
-                let same_dir = video
-                    .as_ref()
-                    .and_then(|v| v.path.parent())
-                    .is_some_and(|vdir| Some(vdir) == sub.path.parent());
-                let action = match action_mode {
-                    ActionMode::Auto => {
-                        if same_dir {
-                            PlannedAction::Rename
-                        } else {
-                            PlannedAction::Copy
-                        }
-                    }
-                    ActionMode::Copy => PlannedAction::Copy,
-                };
+                // Pick the action based on whether the target directory
+                // matches the source directory. `Rename` mode lands in the
+                // subtitle's own directory (so `same_dir` is always true),
+                // but we keep the same derivation so the structural rule
+                // is expressed in one place.
+                let same_dir = target_path.parent() == sub.path.parent();
+                let action = if same_dir { PlannedAction::Rename } else { PlannedAction::Copy };
 
                 ops.push(PlannedOp {
                     video: video.clone(),
@@ -375,7 +389,7 @@ pub fn generate_plan(
         }
     }
 
-    Plan { ops }
+    Ok(Plan { ops })
 }
 
 /// Strip the last `.ext` from a stem, returning the "stem-base" used to
@@ -420,7 +434,8 @@ mod tests {
             entry("/subs/Show 01 _m.ass"),
         ];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Auto);
+        let plan =
+            generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Rename).unwrap();
         let stems: Vec<&str> = plan.ops.iter().map(|o| o.subtitle.stem.as_str()).collect();
         assert_eq!(stems, vec!["Show 01 _a", "Show 01 _m", "Show 01 _z"]);
     }
@@ -431,11 +446,12 @@ mod tests {
         let v = vec![entry("/videos/[Group] Show - 01 [1080p].mkv")];
         let s = vec![entry("/subs/Show.S01E01.chs.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Auto);
+        let plan =
+            generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Rename).unwrap();
         assert_eq!(plan.ops.len(), 1);
         let op = &plan.ops[0];
         assert_eq!(op.target_basename, "[Group] Show - 01 [1080p].ass");
-        assert_eq!(op.action, PlannedAction::Copy); // different dirs
+        assert_eq!(op.action, PlannedAction::Rename); // target in subtitle dir
         assert!(!plan.has_conflicts());
     }
 
@@ -447,7 +463,7 @@ mod tests {
         let r = m.match_files(&v, &s, None, None);
         let cfg =
             NamingConfig { template: "${video}.zh-Hans.${ext}".into(), ..NamingConfig::default() };
-        let plan = generate_plan(&r, &cfg, &NoExists, ActionMode::Auto);
+        let plan = generate_plan(&r, &cfg, &NoExists, ActionMode::Rename).unwrap();
         assert_eq!(plan.ops[0].target_basename, "Show - 01.zh-Hans.ass");
     }
 
@@ -462,7 +478,7 @@ mod tests {
             auto_fill_lang: true,
             ..NamingConfig::default()
         };
-        let plan = generate_plan(&r, &cfg, &NoExists, ActionMode::Auto);
+        let plan = generate_plan(&r, &cfg, &NoExists, ActionMode::Rename).unwrap();
         assert_eq!(plan.ops[0].target_basename, "Show - 01.zh-Hant.ass");
     }
 
@@ -481,7 +497,7 @@ mod tests {
             }],
             ..NamingConfig::default()
         };
-        let plan = generate_plan(&r, &cfg, &NoExists, ActionMode::Auto);
+        let plan = generate_plan(&r, &cfg, &NoExists, ActionMode::Rename).unwrap();
         assert_eq!(plan.ops[0].target_basename, "Show - 01.zh-Hans.ass");
     }
 
@@ -503,7 +519,7 @@ mod tests {
             }],
             ..NamingConfig::default()
         };
-        let plan = generate_plan(&r, &cfg, &NoExists, ActionMode::Auto);
+        let plan = generate_plan(&r, &cfg, &NoExists, ActionMode::Rename).unwrap();
         assert_eq!(plan.ops[0].target_basename, "Show - 01.zh-Hans.ass");
     }
 
@@ -518,7 +534,7 @@ mod tests {
             template: "${video}.${group}-${lang}.${ext}".into(),
             ..NamingConfig::default()
         };
-        let plan = generate_plan(&r, &cfg, &NoExists, ActionMode::Auto);
+        let plan = generate_plan(&r, &cfg, &NoExists, ActionMode::Rename).unwrap();
         assert_eq!(plan.ops[0].target_basename, "Show - 01.ass");
     }
 
@@ -528,7 +544,8 @@ mod tests {
         let v = vec![entry("/videos/Show - 01.mkv")];
         let s = vec![entry("/subs/Show.S01E01.idx"), entry("/subs/Show.S01E01.sub")];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Auto);
+        let plan =
+            generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Rename).unwrap();
         assert_eq!(plan.ops.len(), 2);
         let basenames: Vec<&str> = plan.ops.iter().map(|o| o.target_basename.as_str()).collect();
         assert!(basenames.contains(&"Show - 01.idx"));
@@ -545,7 +562,8 @@ mod tests {
         let v = vec![entry("/media/Show - 01.mkv")];
         let s = vec![entry("/media/Show.S01E01.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Auto);
+        let plan =
+            generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Rename).unwrap();
         assert_eq!(plan.ops[0].action, PlannedAction::Rename);
     }
 
@@ -562,7 +580,8 @@ mod tests {
         let v = vec![entry("/media/Show - 01.mkv")];
         let s = vec![entry("/media/Show.S01E01.chs.ass"), entry("/media/Show.S01E01.chs.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Auto);
+        let plan =
+            generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Rename).unwrap();
         assert!(plan.has_conflicts());
         assert!(
             plan.ops
@@ -583,7 +602,8 @@ mod tests {
         let v = vec![entry("/media/Show - 01.mkv")];
         let s = vec![entry("/subs/Show.S01E01.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &NamingConfig::default(), &AlwaysExists, ActionMode::Auto);
+        let plan =
+            generate_plan(&r, &NamingConfig::default(), &AlwaysExists, ActionMode::Rename).unwrap();
         assert!(plan.has_conflicts());
         assert!(
             plan.ops
@@ -593,33 +613,52 @@ mod tests {
     }
 
     #[test]
-    fn action_mode_auto_uses_rename_in_place() {
+    fn action_mode_rename_uses_rename_in_place() {
         let m = Matcher::new();
         let v = vec![entry("/media/Show - 01.mkv")];
         let s = vec![entry("/media/Show.S01E01.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Auto);
+        let plan =
+            generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Rename).unwrap();
         assert_eq!(plan.ops[0].action, PlannedAction::Rename);
     }
 
     #[test]
-    fn action_mode_auto_uses_copy_across_dirs() {
+    fn action_mode_rename_stays_in_subtitle_dir() {
         let m = Matcher::new();
         let v = vec![entry("/videos/Show - 01.mkv")];
         let s = vec![entry("/subs/Show.S01E01.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Auto);
-        assert_eq!(plan.ops[0].action, PlannedAction::Copy);
+        let plan =
+            generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Rename).unwrap();
+        // Rename mode puts the target inside the subtitle's own dir; the
+        // resulting action is `Rename` (same-dir target_path).
+        assert_eq!(plan.ops[0].action, PlannedAction::Rename);
+        assert_eq!(plan.ops[0].target_path.parent().unwrap(), Path::new("/subs"));
     }
 
     #[test]
-    fn action_mode_copy_overrides_rename() {
+    fn action_mode_copy_to_video_dir() {
         let m = Matcher::new();
-        let v = vec![entry("/media/Show - 01.mkv")];
-        let s = vec![entry("/media/Show.S01E01.ass")];
+        let v = vec![entry("/videos/Show - 01.mkv")];
+        let s = vec![entry("/subs/Show.S01E01.ass")];
         let r = m.match_files(&v, &s, None, None);
-        let plan = generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Copy);
+        let plan =
+            generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Copy).unwrap();
         assert_eq!(plan.ops[0].action, PlannedAction::Copy);
+        assert_eq!(plan.ops[0].target_path.parent().unwrap(), Path::new("/videos"));
+    }
+
+    #[test]
+    fn action_mode_copy_without_video_errors() {
+        let m = Matcher::new();
+        let v: Vec<FileEntry> = Vec::new();
+        let s = vec![entry("/subs/Show.S01E01.ass")];
+        let r = m.match_files(&v, &s, None, None);
+        match generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Copy) {
+            Err(PlanError::NoVideoForCopy { op_index }) => assert_eq!(op_index, 0),
+            other => panic!("expected NoVideoForCopy, got {other:?}"),
+        }
     }
 
     fn mapping(token: &str, value: &str, var: &str) -> TokenMapping {
