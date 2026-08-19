@@ -1,19 +1,65 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
-  <rect x="0" y="0" width="512" height="512" rx="115" fill="#6366F1"/>
+  <defs>
+    <!-- 背景渐变: 简洁深邃的暗色 -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E293B" />
+      <stop offset="100%" stop-color="#0F172A" />
+    </linearGradient>
+    <!-- 主文件的轻微阴影, 增加层次感 -->
+    <filter id="shadow" x="-10%" y="-10%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000000" flood-opacity="0.35" />
+    </filter>
+    <!-- RE 徽章的发光效果, 突显动作 -->
+    <filter id="badgeGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="10" flood-color="#F97316" flood-opacity="0.3" />
+    </filter>
+  </defs>
 
-  <rect x="96" y="116" width="320" height="296" rx="30" fill="#000000" opacity="0.12"/>
-  <rect x="96" y="108" width="320" height="296" rx="30" fill="#FFFFFF"/>
+  <!-- 1:1 圆角底板 (类似 macOS/iOS 图标风格) -->
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="url(#bgGrad)" />
 
-  <polygon points="232,182 232,270 316,226" fill="#6366F1"/>
+  <!-- === 文件 1 (最底层): 用于强化"批量"印象 === -->
+  <rect x="125" y="175" width="200" height="250" rx="20" fill="#1E293B" opacity="0.5" />
+  <rect x="155" y="215" width="110" height="12" rx="6" fill="#475569" />
+  <rect x="155" y="240" width="130" height="12" rx="6" fill="#475569" />
+  <rect x="155" y="265" width="90" height="12" rx="6" fill="#475569" />
 
-  <rect x="128" y="342" width="256" height="36" rx="18" fill="#FBBF24"/>
+  <!-- === 文件 2 (中间层): 进一步强化"批量" === -->
+  <rect x="150" y="150" width="220" height="270" rx="22" fill="#334155" opacity="0.8" />
+  <rect x="180" y="195" width="130" height="12" rx="6" fill="#64748B" />
+  <rect x="180" y="225" width="150" height="12" rx="6" fill="#64748B" />
+  <rect x="180" y="255" width="100" height="12" rx="6" fill="#64748B" />
 
-  <circle cx="400" cy="400" r="54" fill="#6366F1"/>
-  <circle cx="400" cy="400" r="45" fill="#FFFFFF"/>
+  <!-- === 文件 3 (最顶层 / 主文件): 带有清晰的字幕特征 === -->
+  <g filter="url(#shadow)">
+    <!-- 白色文件主体 -->
+    <rect x="170" y="120" width="220" height="290" rx="24" fill="#FFFFFF" />
 
-  <rect x="374" y="386" width="36" height="8" rx="4" fill="#6366F1"/>
-  <polygon points="426,390 410,382 410,398" fill="#6366F1"/>
+    <!-- 字幕内容行 (文本) -->
+    <rect x="200" y="185" width="150" height="14" rx="6" fill="#CBD5E1" />
+    <rect x="200" y="220" width="170" height="14" rx="6" fill="#CBD5E1" />
+    <rect x="200" y="255" width="120" height="14" rx="6" fill="#CBD5E1" />
 
-  <rect x="390" y="406" width="36" height="8" rx="4" fill="#6366F1"/>
-  <polygon points="374,410 390,402 390,418" fill="#6366F1"/>
+    <!-- 字幕时间码 (明确"字幕"身份的关键细节) -->
+    <rect x="200" y="290" width="60" height="10" rx="4" fill="#94A3B8" />
+    <rect x="268" y="290" width="8" height="10" rx="2" fill="#CBD5E1" />
+    <rect x="284" y="290" width="60" height="10" rx="4" fill="#94A3B8" />
+
+    <!-- 文件名高亮区域 (黄色高亮, 表示"正在重命名此文件") -->
+    <rect x="195" y="145" width="140" height="24" rx="6" fill="#FDE047" />
+    <!-- 模拟文件名: 主名 + 扩展名 (.ass / .srt) -->
+    <rect x="210" y="155" width="80" height="6" rx="3" fill="#D97706" />
+    <rect x="295" y="155" width="6" height="6" rx="3" fill="#D97706" />
+    <!-- 红色高亮后缀, 暗示修改扩展名或匹配视频名称 -->
+    <rect x="305" y="155" width="20" height="6" rx="3" fill="#EF4444" />
+  </g>
+
+  <!-- === "RE" 重命名动作徽章 (浮动于右上角, 指向文件名区域) === -->
+  <g filter="url(#badgeGlow)">
+    <!-- 橙色圆角方形徽章 -->
+    <rect x="335" y="90" width="88" height="88" rx="24" fill="#F97316" />
+    <!-- 缩写 "RE" (Rename) -->
+    <text x="379" y="146" font-family="system-ui, -apple-system, sans-serif" font-size="44"
+      font-weight="800" fill="#0F172A" text-anchor="middle">RE</text>
+  </g>
 </svg>
