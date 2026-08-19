@@ -44,14 +44,14 @@ jobs:
 
       - name: Verify Windows DLL dependencies
         run: |
-          x86_64-w64-mingw32-objdump -p target/x86_64-pc-windows-gnu/release/subtitle-renamer.exe | grep 'DLL Name'
-          ! x86_64-w64-mingw32-objdump -p target/x86_64-pc-windows-gnu/release/subtitle-renamer.exe | grep -q 'libwinpthread'
+          x86_64-w64-mingw32-objdump -p target/x86_64-pc-windows-gnu/release/SubRE.exe | grep 'DLL Name'
+          ! x86_64-w64-mingw32-objdump -p target/x86_64-pc-windows-gnu/release/SubRE.exe | grep -q 'libwinpthread'
 
       - name: Package Linux (tar.gz)
         run: |
-          d="subtitle-renamer-${RELEASE_VERSION}-x86_64-linux"
+          d="SubRE-${RELEASE_VERSION}-x86_64-linux"
           mkdir -p "dist/$d"
-          cp target/release/subtitle-renamer "dist/$d/"
+          cp target/release/SubRE "dist/$d/"
           cp install.sh "dist/$d/"
           cp -r assets "dist/$d/"
           cp LICENSE "dist/$d/"
@@ -59,9 +59,9 @@ jobs:
 
       - name: Package Windows (zip)
         run: |
-          d="subtitle-renamer-${RELEASE_VERSION}-x86_64-windows"
+          d="SubRE-${RELEASE_VERSION}-x86_64-windows"
           mkdir -p "dist/$d"
-          cp target/x86_64-pc-windows-gnu/release/subtitle-renamer.exe "dist/$d/"
+          cp target/x86_64-pc-windows-gnu/release/SubRE.exe "dist/$d/"
           cp LICENSE "dist/$d/"
           (cd "dist/$d" && zip -r "../../$d.zip" .)
 
@@ -70,5 +70,5 @@ jobs:
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: |
-            subtitle-renamer-*-x86_64-linux.tar.gz
-            subtitle-renamer-*-x86_64-windows.zip
+            SubRE-*-x86_64-linux.tar.gz
+            SubRE-*-x86_64-windows.zip

@@ -1,9 +1,9 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use subtitle_renamer::core::config::{ConfigStore, UserConfig};
-use subtitle_renamer::core::state::StateDb;
-use subtitle_renamer::ui::app::App;
-use subtitle_renamer::ui::fonts;
+use subre::core::config::{ConfigStore, UserConfig};
+use subre::core::state::{StateDb, default_state_path};
+use subre::ui::app::App;
+use subre::ui::fonts;
 
 /// Global body/button font size (px). Bumped from egui's 14 default for
 /// fullscreen readability. Not yet a config item.
@@ -14,9 +14,9 @@ fn main() -> eframe::Result<()> {
         eprintln!("warning: config load failed ({e}); starting with defaults");
         UserConfig::default()
     });
-    let history = StateDb::open_default().unwrap_or_else(|e| {
+    let state = StateDb::open_default().unwrap_or_else(|e| {
         eprintln!("warning: state db unavailable ({e}); starting without persistence");
-        StateDb::open(&std::env::temp_dir().join("subtitle-renamer-fallback.db"))
+        StateDb::open(&default_state_path().with_file_name("state-fallback.db"))
             .expect("fallback db")
     });
     let (fonts, font_notice) = fonts::build_font_definitions();
@@ -27,14 +27,12 @@ fn main() -> eframe::Result<()> {
     if config.always_on_top {
         viewport = viewport.with_always_on_top();
     }
-    if let Ok(icon) =
-        eframe::icon_data::from_png_bytes(include_bytes!("../assets/subtitle-renamer.png"))
-    {
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/SubRE.png")) {
         viewport = viewport.with_icon(icon);
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
-        "subtitle-renamer",
+        "SubRE",
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_fonts(fonts);
@@ -46,7 +44,7 @@ fn main() -> eframe::Result<()> {
                     .text_styles
                     .insert(egui::TextStyle::Button, egui::FontId::proportional(BODY_FONT_SIZE));
             });
-            let mut app = App::new(config, history);
+            let mut app = App::new(config, state);
             if let Some(msg) = font_notice {
                 app.push_status(msg);
             }

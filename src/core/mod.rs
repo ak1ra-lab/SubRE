@@ -1,4 +1,4 @@
-//! Core logic for subtitle-renamer.
+//! Core logic for `SubRE`.
 //!
 //! This module is intentionally GUI-free: it owns parsing, matching, planning,
 //! execution and the sqlite-backed history. The GUI layer (`crate::ui`) consumes

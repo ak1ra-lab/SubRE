@@ -12,8 +12,8 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use subtitle_renamer::core::matcher::FileEntry;
-use subtitle_renamer::core::plan::{NamingConfig, TokenMapping, render_template};
+use subre::core::matcher::FileEntry;
+use subre::core::plan::{NamingConfig, TokenMapping, render_template};
 
 #[derive(Debug, Deserialize)]
 struct Fixture {

@@ -1,4 +1,4 @@
-//! eframe App implementation for the subtitle-renamer GUI.
+//! eframe App implementation for the `SubRE` GUI.
 //!
 //! Layout (eframe 4-zone):
 //!   - `SidePanel`: two `CollapsingHeader`s (`📁 Video source` /
@@ -48,7 +48,7 @@ const STATUS_DEFAULT_HEIGHT: f32 = 72.0;
 const STATUS_MIN_HEIGHT: f32 = 24.0;
 
 /// Canonical repository URL, shown in the About dialog.
-const REPO_URL: &str = "https://github.com/ak1ra-lab/subtitle-renamer";
+const REPO_URL: &str = "https://github.com/ak1ra-lab/SubRE";
 
 /// Which side a path should be ingested onto when the user explicitly
 /// picks `Browse…`.
@@ -137,7 +137,7 @@ pub enum ActiveTab {
 pub struct App {
     pub registry: ExtensionRegistry,
     pub config: UserConfig,
-    pub history: StateDb,
+    pub state: StateDb,
 
     pub video_entries: Vec<FileEntry>,
     pub subtitle_entries: Vec<FileEntry>,
@@ -206,7 +206,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: UserConfig, history: StateDb) -> Self {
+    pub fn new(config: UserConfig, state: StateDb) -> Self {
         let mut registry = ExtensionRegistry::new();
         for ext in &config.custom_video_exts {
             registry.add_custom_video(ext);
@@ -226,7 +226,7 @@ impl App {
             action_mode: config.action_mode,
             always_on_top: config.always_on_top,
             config,
-            history,
+            state,
             video_entries: Vec::new(),
             subtitle_entries: Vec::new(),
             unknown_entries: Vec::new(),
@@ -405,10 +405,10 @@ impl App {
             if ambiguous.contains(&(dir.clone(), cs.clone())) {
                 continue;
             }
-            if let Ok(hits) = self.history.timeline_for(&dir, &cs) {
+            if let Ok(hits) = self.state.timeline_for(&dir, &cs) {
                 entries.extend(hits.into_iter().map(TimelineEntry::Rename));
             }
-            if let Ok(hits) = self.history.copies_for_identity(&dir, &cs) {
+            if let Ok(hits) = self.state.copies_for_identity(&dir, &cs) {
                 entries.extend(hits.into_iter().map(TimelineEntry::Copy));
             }
         }
@@ -520,7 +520,7 @@ impl App {
                                     );
                                     let sid = match session_ids.get(&sub_dir) {
                                         Some(&id) => id,
-                                        None => match self.history.create_session(Some(&sub_dir)) {
+                                        None => match self.state.create_session(Some(&sub_dir)) {
                                             Ok(id) => {
                                                 session_ids.insert(sub_dir.clone(), id);
                                                 id
@@ -580,7 +580,7 @@ impl App {
         ) else {
             return;
         };
-        if let Err(e) = self.history.record_rename(
+        if let Err(e) = self.state.record_rename(
             session_id,
             dir,
             checksum,
@@ -620,7 +620,7 @@ impl App {
                 return;
             }
         };
-        if let Err(e) = self.history.record_copy(
+        if let Err(e) = self.state.record_copy(
             None,
             src_dir,
             src_name,
@@ -639,7 +639,7 @@ impl App {
     /// them automatically. Reducing an undo session naturally serves as a
     /// redo, so the same code path handles both directions.
     pub fn undo_last(&mut self) {
-        let sessions = match self.history.list_sessions() {
+        let sessions = match self.state.list_sessions() {
             Ok(s) => s,
             Err(e) => {
                 self.push_status(format!("history read failed: {e}"));
@@ -648,7 +648,7 @@ impl App {
         };
         let target = sessions
             .into_iter()
-            .find(|s| self.history.renames_for_session(s.id).is_ok_and(|r| !r.is_empty()));
+            .find(|s| self.state.renames_for_session(s.id).is_ok_and(|r| !r.is_empty()));
         match target {
             Some(s) => self.undo_session(s.id),
             None => self.push_status("Nothing to undo."),
@@ -661,7 +661,7 @@ impl App {
             self.push_status("处理中,请稍候再还原。");
             return;
         }
-        let renames = match self.history.renames_for_session(session_id) {
+        let renames = match self.state.renames_for_session(session_id) {
             Ok(r) => r,
             Err(e) => {
                 self.push_status(format!("history read failed: {e}"));
@@ -682,7 +682,7 @@ impl App {
             stored.clone()
         };
 
-        let undo_session = match self.history.create_undo_session(session_id) {
+        let undo_session = match self.state.create_undo_session(session_id) {
             Ok(id) => id,
             Err(e) => {
                 self.push_status(format!("history undo session failed: {e}"));
@@ -708,7 +708,7 @@ impl App {
             match rollback_unit(&items) {
                 RollbackOutcome::Ok => {
                     for r in unit {
-                        if let Err(e) = self.history.record_rename(
+                        if let Err(e) = self.state.record_rename(
                             undo_session,
                             Path::new(&r.dir),
                             &r.checksum,
@@ -938,7 +938,7 @@ impl App {
             .plan
             .as_ref()
             .map_or(0, |p| p.ops.iter().filter(|op| op.conflicts.is_empty()).count());
-        let history_n = self.history.list_sessions().map_or(0, |s| s.len());
+        let history_n = self.state.list_sessions().map_or(0, |s| s.len());
 
         ui.horizontal(|ui| {
             ui.selectable_label(self.active_tab == ActiveTab::Plan, format!("Plan ({plan_n})"))
@@ -1264,7 +1264,7 @@ impl App {
         });
 
         let session_limit = self.history_view.page_size + self.history_view.show_older_offset;
-        let sessions_all = match self.history.list_sessions() {
+        let sessions_all = match self.state.list_sessions() {
             Ok(s) => s,
             Err(e) => {
                 ui.label(format!("history read failed: {e}"));
@@ -1274,7 +1274,7 @@ impl App {
         let sessions: Vec<SessionRecord> = sessions_all
             .iter()
             .filter(|s| {
-                session_matches(&self.history, s, &self.history_view, &scope_dirs, scope_empty)
+                session_matches(&self.state, s, &self.history_view, &scope_dirs, scope_empty)
             })
             .take(session_limit)
             .cloned()
@@ -1287,7 +1287,7 @@ impl App {
         let mut to_undo: Option<i64> = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for s in &sessions {
-                let rename_count = self.history.renames_for_session(s.id).map_or(0, |r| r.len());
+                let rename_count = self.state.renames_for_session(s.id).map_or(0, |r| r.len());
                 let subtitle_dir = s.subtitle_dir.clone().unwrap_or_else(|| "(none)".into());
                 let title = match s.undo_of {
                     Some(orig) => format!(
@@ -1306,7 +1306,7 @@ impl App {
                         rename_count
                     ),
                 };
-                ui.collapsing(title, |ui| match self.history.renames_for_session(s.id) {
+                ui.collapsing(title, |ui| match self.state.renames_for_session(s.id) {
                     Ok(renames) => {
                         let units = group_units(&renames);
                         if units.is_empty() {
@@ -1337,7 +1337,7 @@ impl App {
         let filtered_total = sessions_all
             .iter()
             .filter(|s| {
-                session_matches(&self.history, s, &self.history_view, &scope_dirs, scope_empty)
+                session_matches(&self.state, s, &self.history_view, &scope_dirs, scope_empty)
             })
             .count();
         let remaining = filtered_total.saturating_sub(session_limit);
@@ -1346,7 +1346,7 @@ impl App {
         }
 
         // Copies foldout.
-        let copies = match self.history.copies_in_dirs(&scope_dirs) {
+        let copies = match self.state.copies_in_dirs(&scope_dirs) {
             Ok(c) => c,
             Err(e) => {
                 ui.label(format!("copies read failed: {e}"));
@@ -1643,7 +1643,7 @@ fn conflict_summary(c: &Conflict) -> &'static str {
 }
 
 fn mv_script(plan: &Plan) -> String {
-    let mut out = String::from("#!/bin/sh\n# generated by subtitle-renamer\n");
+    let mut out = String::from("#!/bin/sh\n# generated by SubRE\n");
     for op in &plan.ops {
         let cmd = match op.action {
             PlannedAction::Rename => "mv",

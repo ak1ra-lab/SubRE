@@ -29,12 +29,9 @@ pub struct UserConfig {
     pub always_on_top: bool,
 }
 
-/// Returns the default config path: `dirs::config_dir()/subtitle-renamer/config.toml`.
+/// Returns the default config path: `dirs::config_dir()/SubRE/config.toml`.
 pub fn default_config_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("subtitle-renamer")
-        .join("config.toml")
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("SubRE").join("config.toml")
 }
 
 #[derive(Debug)]

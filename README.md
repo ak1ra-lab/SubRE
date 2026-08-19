@@ -1,8 +1,6 @@
-# subtitle-renamer
+# SubRE
 
 桌面端字幕批量重命名工具. 基于集数 key 自动配对视频与字幕文件, 把外挂字幕改名为视频同名(可配置后缀)以便播放器自动载入.
-
-技术栈: Rust + egui(eframe). 核心逻辑 (`core` 模块) 与 GUI 完全分离, 可独立单测. 运行时数据: sqlite 历史库(用户数据目录); 配置: TOML(用户配置目录). 产物为单文件静态二进制.
 
 ## 特性
 
@@ -18,7 +16,7 @@
 ```bash
 # release build (~19 MB stripped)
 cargo build --release
-./target/release/subtitle-renamer
+./target/release/SubRE
 ```
 
 ## 使用
@@ -32,15 +30,18 @@ cargo build --release
 
 ## 数据文件位置
 
-- 历史数据库: `$XDG_DATA_HOME/subtitle-renamer/history.db` (`~/.local/share/subtitle-renamer/history.db`)
-- 配置文件: `$XDG_CONFIG_HOME/subtitle-renamer/config.toml` (`~/.config/subtitle-renamer/config.toml`)
+- 历史数据库: `$XDG_DATA_HOME/SubRE/state.db` (`~/.local/share/SubRE/state.db`)
+- 配置文件: `$XDG_CONFIG_HOME/SubRE/config.toml` (`~/.config/SubRE/config.toml`)
 
 ## 配置示例
 
 ```toml
 custom_video_exts = []
 custom_subtitle_exts = []
-action_mode = "Auto"
+
+# ActionMode 取值: "Rename"(默认,同目录改名)或 "Copy"(跨目录复制保护原件)
+# 历史配置里的 "Auto" / "Move" 仍会被识别为 "Rename"
+action_mode = "Rename"
 
 [suffix]
 global = ""
@@ -64,33 +65,12 @@ cargo test                # 单元测试 + 语料集成测试
 cargo build --release
 ```
 
-模块划分:
-
-```
-src/
-├── main.rs              # eframe 入口
-├── lib.rs               # 公开 crate API
-├── ui/                  # GUI 层 (依赖 eframe)
-│   ├── app.rs           # eframe::App 实现: 三列表格, Browse 载入, 设置栏, 历史面板
-│   └── fonts.rs         # CJK 字体注册(确保中文/日文界面可见)
-└── core/                # GUI-free, 可独立单测
-    ├── parse.rs         # 文件类型识别 + token 对齐 key 提取 + 归一化 (NFKD / whitespace)
-    ├── matcher.rs       # 视频 × 字幕按 key 配对 + 手动指派 API
-    ├── plan.rs          # 纯函数: 配对 + 后缀配置 → 操作列表 + 冲突列表
-    ├── execute.rs       # rename / copy + 还原校验
-    ├── history.rs       # sqlite 历史持久化层
-    └── config.rs        # TOML 配置持久化
-tests/
-├── corpus.rs            # 语料驱动集成测试 (per-case pass/fail/wontfix 报告)
-└── fixtures/
-    ├── match_cases.json          # 9 个手写 case
-    └── match_cases_subrenamer.json   # 12 个 case, 移植自 qwqcode/SubRenamer (GPL-2.0)
-```
-
 ## AI 使用声明
 
 本项目在开发过程中大量使用 AI 辅助生成代码. 作者仍在学习 Rust, 尚未对全部代码进行独立人工审阅, 使用前请自行评估风险.
 
 ## 许可
 
-GPL-3.0-or-later. 详见 `LICENSE`. SubRenamer 语料来自 [qwqcode/SubRenamer](https://github.com/qwqcode/SubRenamer), 按 GPL-2.0 授权, 在 `tests/fixtures/match_cases_subrenamer.json` 文件头保留来源标注.
+GPL-3.0-or-later. 详见 `LICENSE`.
+
+`tests/fixtures/match_cases_subrenamer.json` 语料来自 [qwqcode/SubRenamer](https://github.com/qwqcode/SubRenamer), 按 GPL-2.0 授权, 在文件头保留来源标注.

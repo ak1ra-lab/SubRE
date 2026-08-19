@@ -1,4 +1,4 @@
-// Embed the multi-resolution `assets/subtitle-renamer.ico` into the Windows
+// Embed the multi-resolution `assets/SubRE.ico` into the Windows
 // PE resource section so the `.exe` displays the app icon in Explorer /
 // taskbar / shortcuts (matching the runtime window icon set in
 // `src/main.rs`). No-op on non-Windows targets so Linux/macOS builds are
@@ -30,7 +30,7 @@ fn main() {
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
-    let ico = PathBuf::from(&manifest_dir).join("assets/subtitle-renamer.ico");
+    let ico = PathBuf::from(&manifest_dir).join("assets/SubRE.ico");
     let rc = PathBuf::from(&out_dir).join("resource.rc");
     let obj = PathBuf::from(&out_dir).join("resource.o");
     let lib = PathBuf::from(&out_dir).join("libresource.a");
@@ -112,7 +112,7 @@ fn main() {
     println!("cargo:rustc-link-search=native={out_dir}");
     println!("cargo:rustc-link-lib=static:+whole-archive=resource");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=assets/subtitle-renamer.ico");
-    println!("cargo:rerun-if-changed=assets/subtitle-renamer.svg");
+    println!("cargo:rerun-if-changed=assets/SubRE.ico");
+    println!("cargo:rerun-if-changed=assets/SubRE.svg");
     println!("cargo:rerun-if-changed=Cargo.toml");
 }

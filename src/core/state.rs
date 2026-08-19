@@ -103,9 +103,9 @@ pub struct CopyRecord {
     pub unit_id: Option<String>,
 }
 
-/// Default database location: `dirs::data_dir()/subtitle-renamer/state.db`.
+/// Default database location: `dirs::data_dir()/SubRE/state.db`.
 pub fn default_state_path() -> PathBuf {
-    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("subtitle-renamer").join("state.db")
+    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("SubRE").join("state.db")
 }
 
 #[derive(Debug)]
@@ -121,29 +121,11 @@ impl StateDb {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create state db parent {}", parent.display()))?;
         }
-        let conn = Connection::open(Self::resolve_db_path(path)?)
-            .with_context(|| format!("open state db {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("open state db {}", path.display()))?;
         Self::migrate(&conn)?;
         conn.execute_batch(SCHEMA).context("init state schema")?;
         Ok(Self { conn })
-    }
-
-    /// If `state.db` is missing but a legacy `app.db` exists alongside it,
-    /// rename the legacy file in place so the user's history survives the
-    /// storage rename. If `state.db` already exists, or `app.db` does not
-    /// exist, this is a no-op and `path` is returned unchanged.
-    fn resolve_db_path(path: &Path) -> Result<&Path> {
-        if !path.exists()
-            && let Some(parent) = path.parent()
-        {
-            let legacy = parent.join("app.db");
-            if legacy.exists() {
-                std::fs::rename(&legacy, path).with_context(|| {
-                    format!("migrate legacy db {} -> {}", legacy.display(), path.display())
-                })?;
-            }
-        }
-        Ok(path)
     }
 
     /// Bring `conn` up to the current schema. v0/v1 databases had a

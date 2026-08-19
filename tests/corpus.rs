@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use subtitle_renamer::core::matcher::{FileEntry, Matcher};
+use subre::core::matcher::{FileEntry, Matcher};
 
 #[derive(Debug, Deserialize)]
 struct Fixture {

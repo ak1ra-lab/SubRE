@@ -10,21 +10,21 @@ bindir="${prefix}/bin"
 appsdir="${prefix}/share/applications"
 iconbasedir="${prefix}/share/icons/hicolor"
 
-if [ -f "./subtitle-renamer" ]; then
-    bin="./subtitle-renamer"
-elif [ -f "target/release/subtitle-renamer" ]; then
-    bin="target/release/subtitle-renamer"
+if [ -f "./SubRE" ]; then
+    bin="./SubRE"
+elif [ -f "target/release/SubRE" ]; then
+    bin="target/release/SubRE"
 else
-    printf 'subtitle-renamer binary not found (expected ./subtitle-renamer or target/release/subtitle-renamer)\n' >&2
+    printf 'SubRE binary not found (expected ./SubRE or target/release/SubRE)\n' >&2
     exit 1
 fi
 
-install -Dm755 "$bin" "${bindir}/subtitle-renamer"
-install -Dm644 "assets/subtitle-renamer.svg" "${iconbasedir}/scalable/apps/subtitle-renamer.svg"
+install -Dm755 "$bin" "${bindir}/SubRE"
+install -Dm644 "assets/SubRE.svg" "${iconbasedir}/scalable/apps/SubRE.svg"
 
 mkdir -p "${appsdir}"
-sed "s|@BINDIR@|${bindir}|" "assets/subtitle-renamer.desktop" >"${appsdir}/subtitle-renamer.desktop"
-chmod 644 "${appsdir}/subtitle-renamer.desktop"
+sed "s|@BINDIR@|${bindir}|" "assets/SubRE.desktop" >"${appsdir}/SubRE.desktop"
+chmod 644 "${appsdir}/SubRE.desktop"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "${prefix}/share/applications" 2>/dev/null || true
