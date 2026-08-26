@@ -59,7 +59,6 @@
     <!-- 橙色圆角方形徽章 -->
     <rect x="335" y="90" width="88" height="88" rx="24" fill="#F97316" />
     <!-- 缩写 "RE" (Rename) -->
-    <text x="379" y="146" font-family="system-ui, -apple-system, sans-serif" font-size="44"
-      font-weight="800" fill="#0F172A" text-anchor="middle">RE</text>
+    <g transform="translate(347.031 146) scale(0.021484 -0.021484)"><path d="M735 831Q856 831 908.5 876.0Q961 921 961 1024Q961 1126 908.5 1170.0Q856 1214 735 1214H573V831ZM573 565V0H188V1493H776Q1071 1493 1208.5 1394.0Q1346 1295 1346 1081Q1346 933 1274.5 838.0Q1203 743 1059 698Q1138 680 1200.5 616.5Q1263 553 1327 424L1536 0H1126L944 371Q889 483 832.5 524.0Q776 565 682 565Z" fill="#0F172A"/></g><g transform="translate(380.912 146) scale(0.021484 -0.021484)"><path d="M188 1493H1227V1202H573V924H1188V633H573V291H1249V0H188Z" fill="#0F172A"/></g>
   </g>
 </svg>
