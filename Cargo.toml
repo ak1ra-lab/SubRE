@@ -28,6 +28,9 @@ thiserror = "2.0.20"
 toml = "1.1.4"
 unicode-normalization = "0.1.25"
 
+[build-dependencies]
+embed-resource = "3.0.11"
+
 [profile.release]
 strip = true
 lto = true
