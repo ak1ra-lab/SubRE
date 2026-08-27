@@ -25,6 +25,35 @@ pub struct TokenMapping {
     pub var: String,
 }
 
+/// One equal-length token conflict detected while resolving template
+/// variables: among the explicit mappings competing for `var`, the
+/// earliest-occurring `winner_token` took effect and the equally long
+/// `ignored_tokens` were rejected by the tie-break.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MappingTie {
+    pub var: String,
+    pub winner_token: String,
+    pub ignored_tokens: Vec<String>,
+}
+
+/// Merge per-subtitle tie reports, dropping exact duplicates and ordering
+/// deterministically by `(var, winner_token)` for display.
+pub fn merge_ties(ties: impl IntoIterator<Item = MappingTie>) -> Vec<MappingTie> {
+    let mut seen: std::collections::BTreeSet<MappingTie> = std::collections::BTreeSet::new();
+    for tie in ties {
+        seen.insert(tie);
+    }
+    seen.into_iter().collect()
+}
+
+/// Template-variable resolution outcome: the filled variables plus any
+/// equal-length token conflicts worth surfacing in the UI.
+#[derive(Debug, Clone, Default)]
+pub struct VarsResolution {
+    pub vars: HashMap<String, String>,
+    pub ties: Vec<MappingTie>,
+}
+
 fn default_var() -> String {
     "lang".to_string()
 }
@@ -55,19 +84,23 @@ impl NamingConfig {
         if self.template.trim().is_empty() { DEFAULT_TEMPLATE } else { self.template.trim() }
     }
 
-    /// Resolve template variables for `subtitle` into a `var -> value` map.
+    /// Resolve template variables for `subtitle` into a [`VarsResolution`].
     ///
     /// Explicit mappings are matched with boundary + longest-token-first;
     /// among mappings sharing a var, the longest token wins (ties broken by
-    /// earliest occurrence). If `${lang}` is still unset and `auto_fill_lang`
-    /// is on, built-in aliases provide a fallback.
-    pub fn resolve_vars(&self, subtitle: &FileEntry) -> HashMap<String, String> {
+    /// earliest occurrence). Every equal-length group of explicit tokens
+    /// competing for the same var additionally yields a [`MappingTie`] so
+    /// callers can hint which token actually took effect. If `${lang}` is
+    /// still unset and `auto_fill_lang` is on, built-in aliases provide a
+    /// fallback.
+    pub fn resolve_vars(&self, subtitle: &FileEntry) -> VarsResolution {
         let stem = &subtitle.stem;
         let mut vars: HashMap<String, String> = HashMap::new();
 
-        // Track the best (value, token_len, first_pos) per var across all
-        // explicit mappings that match the stem.
-        let mut best: HashMap<&str, (&str, usize, usize)> = HashMap::new();
+        // Best candidate per var, plus every matched candidate so the
+        // equal-length losers of the tie-break can be reported.
+        let mut best: HashMap<&str, (&str, &str, usize, usize)> = HashMap::new();
+        let mut matched: HashMap<&str, Vec<(&str, usize, usize)>> = HashMap::new();
         for m in &self.mappings {
             if m.token.is_empty() || m.value.is_empty() || m.var.is_empty() {
                 continue;
@@ -78,15 +111,31 @@ impl NamingConfig {
             let len = m.token.chars().count();
             let replace = match best.get(m.var.as_str()) {
                 None => true,
-                Some(&(_, blen, bpos)) => len > blen || (len == blen && pos < bpos),
+                Some(&(_, _, blen, bpos)) => len > blen || (len == blen && pos < bpos),
             };
             if replace {
-                best.insert(m.var.as_str(), (m.value.as_str(), len, pos));
+                best.insert(m.var.as_str(), (m.value.as_str(), m.token.as_str(), len, pos));
+            }
+            matched.entry(m.var.as_str()).or_default().push((m.token.as_str(), len, pos));
+        }
+
+        let mut ties: Vec<MappingTie> = Vec::new();
+        for (var, (value, winner, wlen, _wpos)) in &best {
+            vars.insert(var.to_string(), value.to_string());
+            let ignored: Vec<String> = matched[*var]
+                .iter()
+                .filter(|(token, len, _)| *len == *wlen && !token.eq(winner))
+                .map(|(token, _, _)| (*token).to_string())
+                .collect();
+            if !ignored.is_empty() {
+                ties.push(MappingTie {
+                    var: (*var).to_string(),
+                    winner_token: (*winner).to_string(),
+                    ignored_tokens: ignored,
+                });
             }
         }
-        for (var, (value, _, _)) in best {
-            vars.insert(var.to_string(), value.to_string());
-        }
+        ties.sort();
 
         if !vars.contains_key("lang")
             && self.auto_fill_lang
@@ -95,7 +144,7 @@ impl NamingConfig {
             vars.insert("lang".to_string(), lang);
         }
 
-        vars
+        VarsResolution { vars, ties }
     }
 }
 
@@ -332,9 +381,13 @@ pub fn generate_plan(
             // But for target naming we keep each member's own extension and
             // share the template-derived main-name.
             for sub in members {
-                let vars = naming.resolve_vars(sub);
-                let target_basename =
-                    render_template(naming.effective_template(), &vars, &video_main, &sub.ext);
+                let resolved = naming.resolve_vars(sub);
+                let target_basename = render_template(
+                    naming.effective_template(),
+                    &resolved.vars,
+                    &video_main,
+                    &sub.ext,
+                );
                 let target_dir = match action_mode {
                     ActionMode::Rename => {
                         sub.path.parent().map(std::path::Path::to_path_buf).unwrap_or_default()
@@ -689,9 +742,9 @@ mod tests {
             ..NamingConfig::default()
         };
         let sub = entry("[X2&CASO][Death_Note][01]_track3.ass");
-        let vars = cfg.resolve_vars(&sub);
-        assert_eq!(vars.get("group").map(String::as_str), Some("华盟字幕社"));
-        assert_eq!(vars.get("lang").map(String::as_str), Some("zh-Hans"));
+        let resolved = cfg.resolve_vars(&sub);
+        assert_eq!(resolved.vars.get("group").map(String::as_str), Some("华盟字幕社"));
+        assert_eq!(resolved.vars.get("lang").map(String::as_str), Some("zh-Hans"));
     }
 
     #[test]
@@ -701,8 +754,8 @@ mod tests {
             ..NamingConfig::default()
         };
         let sub = entry("..._track3.ass");
-        let vars = cfg.resolve_vars(&sub);
-        assert_eq!(vars.get("lang").map(String::as_str), Some("zh-Hans"));
+        let resolved = cfg.resolve_vars(&sub);
+        assert_eq!(resolved.vars.get("lang").map(String::as_str), Some("zh-Hans"));
     }
 
     #[test]
@@ -712,10 +765,91 @@ mod tests {
             mappings: vec![mapping("chs", "zh-Hans", "lang")],
             ..NamingConfig::default()
         };
-        assert_eq!(cfg.resolve_vars(&entry("Show.CHS.ass")).get("lang").map(String::as_str), None);
         assert_eq!(
-            cfg.resolve_vars(&entry("Show.chs.ass")).get("lang").map(String::as_str),
+            cfg.resolve_vars(&entry("Show.CHS.ass")).vars.get("lang").map(String::as_str),
+            None
+        );
+        assert_eq!(
+            cfg.resolve_vars(&entry("Show.chs.ass")).vars.get("lang").map(String::as_str),
             Some("zh-Hans")
+        );
+    }
+
+    #[test]
+    fn mapping_tie_reports_equal_length_competitors() {
+        let cfg = NamingConfig {
+            mappings: vec![
+                mapping("track5", "tc", "lang"),
+                mapping("track3", "sc", "lang"),
+                // A longer token for the same var must NOT join the tie.
+                mapping("track33", "sg", "lang"),
+            ],
+            ..NamingConfig::default()
+        };
+        let sub = entry("..._track3_x_track5.ass");
+        let resolved = cfg.resolve_vars(&sub);
+        // Vars result identical to the pre-tie-report algorithm: equal
+        // length, earlier occurrence wins.
+        assert_eq!(resolved.vars.get("lang").map(String::as_str), Some("sc"));
+        assert_eq!(
+            resolved.ties,
+            vec![MappingTie {
+                var: "lang".into(),
+                winner_token: "track3".into(),
+                ignored_tokens: vec!["track5".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn mapping_tie_absent_without_equal_length_conflict() {
+        // Unequal lengths: longest wins outright, no tie.
+        let cfg = NamingConfig {
+            mappings: vec![mapping("tr", "a", "lang"), mapping("track3", "b", "lang")],
+            ..NamingConfig::default()
+        };
+        let resolved = cfg.resolve_vars(&entry("..._track3.ass"));
+        assert_eq!(resolved.vars.get("lang").map(String::as_str), Some("b"));
+        assert!(resolved.ties.is_empty());
+
+        // Equal lengths on DIFFERENT vars: no tie either.
+        let cfg2 = NamingConfig {
+            mappings: vec![mapping("tk3", "a", "lang"), mapping("tk7", "b", "group")],
+            ..NamingConfig::default()
+        };
+        let resolved2 = cfg2.resolve_vars(&entry("..._tk3_tk7.ass"));
+        assert_eq!(resolved2.vars.get("lang").map(String::as_str), Some("a"));
+        assert_eq!(resolved2.vars.get("group").map(String::as_str), Some("b"));
+        assert!(resolved2.ties.is_empty());
+    }
+
+    #[test]
+    fn merge_ties_dedups_across_subtitles() {
+        let tie = |w: &str| MappingTie {
+            var: "lang".into(),
+            winner_token: w.into(),
+            ignored_tokens: vec!["t5".into()],
+        };
+        let merged = merge_ties([
+            tie("t3"),
+            tie("t3"),
+            MappingTie {
+                var: "aa".into(),
+                winner_token: "z".into(),
+                ignored_tokens: vec!["y".into()],
+            },
+        ]);
+        // Deduplicated and deterministically ordered by (var, winner).
+        assert_eq!(
+            merged,
+            vec![
+                MappingTie {
+                    var: "aa".into(),
+                    winner_token: "z".into(),
+                    ignored_tokens: vec!["y".into()]
+                },
+                tie("t3"),
+            ]
         );
     }
 

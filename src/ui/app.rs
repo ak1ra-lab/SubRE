@@ -33,7 +33,7 @@ use crate::core::matcher::{FileEntry, MatchResult, Matcher, collect_media_files}
 use crate::core::parse::{ExtensionRegistry, FileCategory};
 use crate::core::plan::{
     ActionMode, Conflict, NamingConfig, Plan, PlannedAction, PlannedOp, StdFsProbe, TokenMapping,
-    generate_plan,
+    generate_plan, merge_ties,
 };
 use crate::core::state::{CopyRecord, RenameRecord, SessionRecord, StateDb};
 
@@ -1209,6 +1209,24 @@ impl App {
                     var: "lang".into(),
                 });
                 self.refresh_match_and_plan();
+            }
+
+            // Equal-length token ties, hinted per spec (rendered only when
+            // a tie exists; recomputed every frame from the live editor
+            // state so toggles and edits reflect instantly).
+            let naming = self.current_naming_config();
+            let ties =
+                merge_ties(self.subtitle_entries.iter().flat_map(|s| naming.resolve_vars(s).ties));
+            for t in ties {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xE5, 0xC0, 0x7B),
+                    format!(
+                        "⚠ token 平局: 变量 {} 由 {} 生效({} 同长度,按先出现忽略)",
+                        t.var,
+                        t.winner_token,
+                        t.ignored_tokens.join("、")
+                    ),
+                );
             }
             ui.horizontal(|ui| {
                 ui.label("Video regex (fallback):");

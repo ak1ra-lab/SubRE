@@ -90,7 +90,7 @@ fn run_case(case: &NamingCase) -> Result<(), String> {
     let mut actual: Vec<String> = Vec::new();
     for stem in &case.subtitle_stems {
         let sub = entry(stem);
-        let vars = cfg.resolve_vars(&sub);
+        let resolved = cfg.resolve_vars(&sub);
         // `${video}` and `${ext}` come from the video main-name and the
         // subtitle's actual extension; build a small vars map that
         // exposes the resolved ext alongside the named variables.
@@ -98,9 +98,9 @@ fn run_case(case: &NamingCase) -> Result<(), String> {
         let ext = sub.ext.clone();
         eprintln!(
             "[naming] case={} stem={:?} ext={:?} vars={:?}",
-            case.name, sub.stem, sub.ext, vars
+            case.name, sub.stem, sub.ext, resolved.vars
         );
-        let basename = render_template(cfg.effective_template(), &vars, &video_main, &ext);
+        let basename = render_template(cfg.effective_template(), &resolved.vars, &video_main, &ext);
         actual.push(basename);
     }
 
