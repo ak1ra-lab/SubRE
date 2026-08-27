@@ -392,16 +392,19 @@ fn heuristic_keys(files: &[FileEntry]) -> Vec<Option<EpisodeKey>> {
 }
 
 /// Collect recognized media files from `dir` non-recursively, classifying
-/// each by extension via `registry`. Returns `(videos, subtitles)`; files
-/// with unknown extensions are skipped and subdirectories are not descended.
+/// each by extension via `registry`. Returns `(videos, subtitles,
+/// unknown)`; files with unknown extensions surface in the third slot so
+/// callers can show them as unrecognized (the spec requires visibility),
+/// and subdirectories are not descended.
 pub fn collect_media_files(
     registry: &ExtensionRegistry,
     dir: &std::path::Path,
-) -> (Vec<FileEntry>, Vec<FileEntry>) {
+) -> (Vec<FileEntry>, Vec<FileEntry>, Vec<FileEntry>) {
     let mut videos = Vec::new();
     let mut subtitles = Vec::new();
+    let mut unknown = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return (videos, subtitles);
+        return (videos, subtitles, unknown);
     };
     for entry in rd.flatten() {
         let path = entry.path();
@@ -411,10 +414,10 @@ pub fn collect_media_files(
         match registry.categorize(&path) {
             FileCategory::Video => videos.push(FileEntry::from_path(path)),
             FileCategory::Subtitle => subtitles.push(FileEntry::from_path(path)),
-            FileCategory::Unknown => {}
+            FileCategory::Unknown => unknown.push(FileEntry::from_path(path)),
         }
     }
-    (videos, subtitles)
+    (videos, subtitles, unknown)
 }
 
 // ---------------------------------------------------------------------------
@@ -781,11 +784,44 @@ mod tests {
         std::fs::write(nested.join("d.mkv"), b"v").unwrap();
 
         let reg = ExtensionRegistry::new();
-        let (videos, subtitles) = collect_media_files(&reg, &dir);
+        let (videos, subtitles, unknown) = collect_media_files(&reg, &dir);
         assert_eq!(videos.len(), 1);
         assert_eq!(subtitles.len(), 1);
         assert_eq!(videos[0].stem, "a");
         assert_eq!(subtitles[0].stem, "b");
+        // The plain-text file surfaces as unrecognized instead of being
+        // silently dropped.
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].ext, "txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_media_files_surfaces_unknown_extensions() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "sr_scan_unk_{}_{}_{}",
+            n,
+            std::process::id(),
+            std::thread::current().name().unwrap_or("main")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.mkv"), b"v").unwrap();
+        std::fs::write(dir.join("b.srt"), b"s").unwrap();
+        std::fs::write(dir.join("meta.nfo"), b"x").unwrap();
+
+        let reg = ExtensionRegistry::new();
+        let (videos, subtitles, unknown) = collect_media_files(&reg, &dir);
+        assert_eq!(videos.len(), 1, ".mkv still classified");
+        assert_eq!(subtitles.len(), 1, ".srt still classified");
+        assert_eq!(
+            unknown.iter().map(|f| f.ext.as_str()).collect::<Vec<_>>(),
+            vec!["nfo"],
+            "unknown extensions surface instead of vanishing"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

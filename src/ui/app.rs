@@ -341,12 +341,19 @@ impl App {
     /// the CLI startup scan. Does nothing when the directory holds no
     /// recognized media.
     pub fn ingest_dir_auto(&mut self, dir: &Path) {
-        let (videos, subtitles) = collect_media_files(&self.registry, dir);
-        if videos.is_empty() && subtitles.is_empty() {
+        let (videos, subtitles, unknown) = collect_media_files(&self.registry, dir);
+        if videos.is_empty() && subtitles.is_empty() && unknown.is_empty() {
             return;
         }
         self.video_entries.extend(videos);
         self.subtitle_entries.extend(subtitles);
+        if !unknown.is_empty() {
+            // Spec requires unknown-extension files to stay visible, not
+            // silently disappear; route them into the Unknown section.
+            let n = unknown.len();
+            self.unknown_entries.extend(unknown);
+            self.push_status(format!("{n} unrecognized file(s) (see Unmatched / unknown)。"));
+        }
         self.refresh_match_and_plan();
     }
 
@@ -1216,7 +1223,7 @@ impl App {
                                         }
                                         // Per-row "remove" button: drop this
                                         // subtitle from the loaded set.
-                                        if ui.small_button("x").clicked() {
+                                        if ui.small_button("×").clicked() {
                                             self.subtitle_entries.retain(|e| e.path != sub.path);
                                             self.manual_overrides.remove(&sub.path);
                                             self.refresh_match_and_plan();

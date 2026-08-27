@@ -7,14 +7,14 @@
 - **自动配对**: 基于文件名集合内差异片段提取集数 key, 无需固定命名格式. 支持正则兜底与手动指派.
 - **目标名生成**: 视频主名 + 可选后缀 + 字幕原扩展名. `.idx` + `.sub` 成对作为同一逻辑单元.
 - **后缀三级解析**: 用户标记映射表 → 文件名语言 token 自动提取 → 全局后缀.
-- **执行安全**: 同目录 rename, 跨目录 copy (保护原件). 原地改名写入 sqlite 历史, 按 (目录, 校验和) 身份反查命名史.
-- **可还原**: 原地改名记录 checksum 身份, 还原前重算校验和比对, 不一致即拒绝还原; copy 不落历史.
+- **执行安全**: 动作模式显式二选一 — `Rename` 在字幕目录原地改名并写入 renames 历史; `Copy` 复制到视频目录、源文件原样保留并写入 copies 日志. 按 (目录, 校验和) 身份反查命名史.
+- **可还原**: 原地改名记录 checksum 身份, 还原前重算校验和比对, 不一致即拒绝还原; copy 不落 rename 历史, 撤销 copy = 删除目标文件(过于危险, 故意不提供).
 - **冲突检测**: 目标名重复 / 目标路径已存在均会标记冲突并阻止执行.
 
 ## 安装
 
 ```bash
-# release build (~19 MB stripped)
+# release build (~20 MB stripped)
 cargo build --release
 ./target/release/SubRE
 ```
@@ -28,33 +28,14 @@ cargo build --release
 5. 点击 Apply, 在确认对话框中确认后执行.
 6. 历史面板可浏览过往会话并按单条 / 整批还原.
 
+配置全部通过界面 Settings 区修改, 点 Save config 落盘; 无需手工编辑配置文件.
+
 ## 数据文件位置
 
 - 历史数据库: `$XDG_DATA_HOME/SubRE/state.db` (`~/.local/share/SubRE/state.db`)
 - 配置文件: `$XDG_CONFIG_HOME/SubRE/config.toml` (`~/.config/SubRE/config.toml`)
 
-## 配置示例
-
-```toml
-custom_video_exts = []
-custom_subtitle_exts = []
-
-# ActionMode 取值: "Rename"(默认,同目录改名)或 "Copy"(跨目录复制保护原件)
-# 历史配置里的 "Auto" / "Move" 仍会被识别为 "Rename"
-action_mode = "Rename"
-
-[suffix]
-global = ""
-auto_extract_language_token = false
-
-[suffix.token_map]
-chs = "zh-Hans"
-cht = "zh-Hant"
-
-# 可选: 正则兜底(各含一个捕获组提取集数)
-# video_regex = "(?i)ep(\\d+)"
-# subtitle_regex = "(?i)ep(\\d+)"
-```
+历史遗留配置中的 `action_mode = "Auto"` / `"Move"` 会按启动规则解析为 `Rename`.
 
 ## 开发
 
