@@ -1,0 +1,119 @@
+---
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build (leave empty to use the ref selected in the workflow run dialog)'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            target_dir: target/x86_64-unknown-linux-gnu/release
+            binary_name: SubRE
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            target_dir: target/x86_64-pc-windows-msvc/release
+            binary_name: SubRE.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            target_dir: target/aarch64-apple-darwin/release
+            binary_name: SubRE
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.branch || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="$(git describe --tags --match 'v*')"
+          fi
+          version="${tag#v}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved version: ${version} (tag: ${tag})"
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: false
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package binary
+        env:
+          PACKAGE_OS: ${{ matrix.os }}
+          PACKAGE_TARGET: ${{ matrix.target }}
+          PACKAGE_TARGET_DIR: ${{ matrix.target_dir }}
+          PACKAGE_BINARY_NAME: ${{ matrix.binary_name }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: ./.github/scripts/package.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: SubRE-${{ matrix.target }}
+          path: SubRE-*${{ matrix.target }}.*
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ needs.build.outputs.tag }}
+          name: SubRE ${{ needs.build.outputs.version }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' }}
+          files: dist/**/*
