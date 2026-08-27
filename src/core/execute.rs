@@ -73,6 +73,13 @@ fn do_rename(op: &PlannedOp) -> Result<(), ExecuteError> {
 }
 
 fn do_copy(op: &PlannedOp) -> Result<(), ExecuteError> {
+    // Copy mode where the target basename already equals the source name
+    // (e.g. a re-applied plan) degenerates to src == dst; `fs::copy` onto
+    // itself is unreliable (EINVAL or truncation), so count it as a
+    // successful no-op instead.
+    if op.subtitle.path == op.target_path {
+        return Ok(());
+    }
     fs::copy(&op.subtitle.path, &op.target_path)?;
     Ok(())
 }
@@ -284,6 +291,62 @@ mod tests {
         assert!(report.all_ok());
         assert!(videos.join("Show - 01.ass").exists());
         assert!(sub.exists(), "source must be preserved");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copy_same_dir_preserves_source() {
+        let dir = tmpdir("copy_same_dir");
+        let video = dir.join("Show - 01.mkv");
+        let sub = dir.join("Show.S01E01.ass");
+        write(&video, b"video");
+        write(&sub, b"sub");
+        let m = Matcher::new();
+        let v = vec![crate::core::matcher::FileEntry::from_path(video.clone())];
+        let s = vec![crate::core::matcher::FileEntry::from_path(sub.clone())];
+        let r = m.match_files(&v, &s, None, None);
+        let plan = generate_plan(
+            &r,
+            &NamingConfig::default(),
+            &NoExists,
+            crate::core::plan::ActionMode::Copy,
+        )
+        .unwrap();
+        assert_eq!(plan.ops[0].action, PlannedAction::Copy);
+        let report = execute_plan(&plan).unwrap();
+        assert!(report.all_ok());
+        // Copy semantics hold even in the same directory: the source file
+        // stays and a distinct target appears beside it.
+        assert!(sub.exists(), "source must be preserved");
+        let dst = dir.join("Show - 01.ass");
+        assert!(dst.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"sub");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn self_copy_counts_ok_without_io() {
+        let root = tmpdir("self_copy_ok");
+        let f = root.join("same.ass");
+        write(&f, b"payload");
+        let op = PlannedOp {
+            video: None,
+            subtitle: crate::core::matcher::FileEntry::from_path(f.clone()),
+            target_path: f.clone(),
+            target_basename: "same.ass".into(),
+            action: PlannedAction::Copy,
+            conflicts: Vec::new(),
+            unit_id: None,
+        };
+        let report = execute_plan(&Plan { ops: vec![op] }).unwrap();
+        assert_eq!(report.outcomes.len(), 1);
+        assert!(report.outcomes[0].success);
+        assert!(report.outcomes[0].error.is_none());
+        assert_eq!(report.outcomes[0].action, PlannedAction::Copy);
+        // A failed `fs::copy` onto itself could truncate the file; the
+        // guard must leave it byte-for-byte intact.
+        assert_eq!(std::fs::read(&f).unwrap(), b"payload");
+        assert_eq!(std::fs::metadata(&f).unwrap().len(), 7);
         let _ = std::fs::remove_dir_all(&root);
     }
 

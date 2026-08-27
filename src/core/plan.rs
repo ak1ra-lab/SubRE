@@ -157,7 +157,8 @@ pub struct PlannedOp {
     pub target_path: PathBuf,
     /// The proposed target filename (basename), useful for previewing.
     pub target_basename: String,
-    /// Whether this op will rename (same directory) or copy (cross-directory).
+    /// Whether this op renames in place (`Rename` mode) or copies with the
+    /// source preserved (`Copy` mode). Chosen solely by `ActionMode`.
     pub action: PlannedAction,
     /// Conflicts that apply to this op (empty if clean).
     pub conflicts: Vec<Conflict>,
@@ -347,13 +348,14 @@ pub fn generate_plan(
                 };
                 let target_path = target_dir.join(&target_basename);
 
-                // Pick the action based on whether the target directory
-                // matches the source directory. `Rename` mode lands in the
-                // subtitle's own directory (so `same_dir` is always true),
-                // but we keep the same derivation so the structural rule
-                // is expressed in one place.
-                let same_dir = target_path.parent() == sub.path.parent();
-                let action = if same_dir { PlannedAction::Rename } else { PlannedAction::Copy };
+                // The user's explicit mode alone decides the action; no
+                // directory-equality inference. `Rename` always renames in
+                // place; `Copy` always copies, even when subtitle and video
+                // share a directory.
+                let action = match action_mode {
+                    ActionMode::Rename => PlannedAction::Rename,
+                    ActionMode::Copy => PlannedAction::Copy,
+                };
 
                 ops.push(PlannedOp {
                     video: video.clone(),
@@ -647,6 +649,18 @@ mod tests {
             generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Copy).unwrap();
         assert_eq!(plan.ops[0].action, PlannedAction::Copy);
         assert_eq!(plan.ops[0].target_path.parent().unwrap(), Path::new("/videos"));
+    }
+
+    #[test]
+    fn copy_mode_same_dir_yields_copy_op() {
+        let m = Matcher::new();
+        let v = vec![entry("/media/Show - 01.mkv")];
+        let s = vec![entry("/media/Show.S01E01.ass")];
+        let r = m.match_files(&v, &s, None, None);
+        let plan =
+            generate_plan(&r, &NamingConfig::default(), &NoExists, ActionMode::Copy).unwrap();
+        assert_eq!(plan.ops[0].action, PlannedAction::Copy);
+        assert_eq!(plan.ops[0].target_path.parent().unwrap(), Path::new("/media"));
     }
 
     #[test]

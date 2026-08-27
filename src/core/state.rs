@@ -1,6 +1,6 @@
 //! Application-state persistence: rename history plus session/identity tracking.
 //!
-//! Schema (per design D3, v4):
+//! Schema (per design D3, v5):
 //!
 //! ```sql
 //! sessions(id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL, subtitle_dir TEXT,
@@ -8,8 +8,7 @@
 //! renames(id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL REFERENCES sessions(id),
 //!         dir TEXT NOT NULL, checksum TEXT NOT NULL, unit_id TEXT,
 //!         old_name TEXT NOT NULL, new_name TEXT NOT NULL, at INTEGER NOT NULL);
-//! copies(id INTEGER PRIMARY KEY, session_id INTEGER REFERENCES sessions(id),
-//!        at INTEGER NOT NULL,
+//! copies(id INTEGER PRIMARY KEY, at INTEGER NOT NULL,
 //!        src_dir TEXT NOT NULL, src_name TEXT NOT NULL, src_checksum TEXT NOT NULL,
 //!        dst_dir TEXT NOT NULL, dst_name TEXT NOT NULL, dst_checksum TEXT NOT NULL,
 //!        unit_id TEXT);
@@ -18,7 +17,8 @@
 //! A file's identity is `(dir, checksum)`. Only in-place renames are
 //! recorded (copy is not). Undo creates a new session whose `undo_of`
 //! points back to the session being reversed. `copies` is an append-only
-//! log; undo of a copy is intentionally not supported.
+//! identity log with no session linkage; undo of a copy is intentionally
+//! not supported.
 
 use std::path::{Path, PathBuf};
 
@@ -45,7 +45,6 @@ CREATE TABLE IF NOT EXISTS renames (
 );
 CREATE TABLE IF NOT EXISTS copies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id INTEGER REFERENCES sessions(id),
     at INTEGER NOT NULL,
     src_dir TEXT NOT NULL,
     src_name TEXT NOT NULL,
@@ -59,15 +58,15 @@ CREATE INDEX IF NOT EXISTS idx_renames_identity ON renames(dir, checksum, at);
 CREATE INDEX IF NOT EXISTS idx_renames_session ON renames(session_id);
 CREATE INDEX IF NOT EXISTS idx_copies_dst     ON copies(dst_dir, dst_checksum);
 CREATE INDEX IF NOT EXISTS idx_copies_src     ON copies(src_dir, src_checksum);
-CREATE INDEX IF NOT EXISTS idx_copies_session ON copies(session_id);
 ";
 
-/// Schema version. Older databases (version < 4) predate the
-/// checksum/append-only model and are rebuilt from scratch; v3 just
-/// needs the `working_dir` → `subtitle_dir` rename and the new `copies`
-/// table.
+/// Schema version. Older databases (version < 2) predate the
+/// checksum/append-only model and are rebuilt from scratch; v2/v3 are
+/// migrated straight to v5 (v4 never exists as an intermediate state);
+/// v4 drops the never-populated `copies.session_id` column via a table
+/// rebuild.
 #[allow(dead_code)] // referenced by future migration branches
-const CURRENT_VERSION: i64 = 4;
+const CURRENT_VERSION: i64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
@@ -92,7 +91,6 @@ pub struct RenameRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CopyRecord {
     pub id: i64,
-    pub session_id: Option<i64>,
     pub at: i64,
     pub src_dir: String,
     pub src_name: String,
@@ -123,17 +121,30 @@ impl StateDb {
         }
         let conn =
             Connection::open(path).with_context(|| format!("open state db {}", path.display()))?;
+        // One-shot best-effort safety net before the destructive v4 -> v5
+        // copies rebuild: snapshot the file once as `<name>.db.bak-v4`,
+        // skipping when that snapshot already exists (idempotent across
+        // reopens).
+        let pre_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
+        if pre_version == 4 {
+            let bak = path.with_extension("db.bak-v4");
+            if !bak.exists() {
+                let _ = std::fs::copy(path, &bak);
+            }
+        }
         Self::migrate(&conn)?;
         conn.execute_batch(SCHEMA).context("init state schema")?;
         Ok(Self { conn })
     }
 
     /// Bring `conn` up to the current schema. v0/v1 databases had a
-    /// different shape and are dropped wholesale; v2 only needs
-    /// `token_mappings` removed (already lands at v3); v3 → v4 renames
-    /// `sessions.working_dir` → `sessions.subtitle_dir` and adds the
-    /// `copies` table + its indexes. Fresh databases (version 0) get the
-    /// current schema for free via `SCHEMA` after this runs.
+    /// different shape and are dropped wholesale; v2/v3 lose the vestigial
+    /// `token_mappings` table (v2), rename `sessions.working_dir` →
+    /// `sessions.subtitle_dir`, and gain the session-free `copies` table,
+    /// all landing directly at v5. v4 rebuilds `copies` without its dead
+    /// `session_id` column inside one transaction. Fresh databases
+    /// (version 0) get the current schema for free via `SCHEMA` after
+    /// this runs.
     fn migrate(conn: &Connection) -> Result<()> {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -144,7 +155,7 @@ impl StateDb {
                  DROP TABLE IF EXISTS sessions;
                  DROP TABLE IF EXISTS renames;
                  DROP TABLE IF EXISTS token_mappings;
-                 PRAGMA user_version = 4;",
+                 PRAGMA user_version = 5;",
             )
             .context("migrate: drop pre-v2 state tables")?;
         } else if version == 2 {
@@ -153,7 +164,6 @@ impl StateDb {
                  ALTER TABLE sessions RENAME COLUMN working_dir TO subtitle_dir;
                  CREATE TABLE IF NOT EXISTS copies (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     session_id INTEGER REFERENCES sessions(id),
                      at INTEGER NOT NULL,
                      src_dir TEXT NOT NULL,
                      src_name TEXT NOT NULL,
@@ -163,18 +173,16 @@ impl StateDb {
                      dst_checksum TEXT NOT NULL,
                      unit_id TEXT
                  );
-                 CREATE INDEX IF NOT EXISTS idx_copies_dst     ON copies(dst_dir, dst_checksum);
-                 CREATE INDEX IF NOT EXISTS idx_copies_src     ON copies(src_dir, src_checksum);
-                 CREATE INDEX IF NOT EXISTS idx_copies_session ON copies(session_id);
-                 PRAGMA user_version = 4;",
+                 CREATE INDEX IF NOT EXISTS idx_copies_dst ON copies(dst_dir, dst_checksum);
+                 CREATE INDEX IF NOT EXISTS idx_copies_src ON copies(src_dir, src_checksum);
+                 PRAGMA user_version = 5;",
             )
-            .context("migrate: v2 -> v4 (drop token_mappings, rename column, add copies)")?;
+            .context("migrate: v2 -> v5 (drop token_mappings, rename column, add copies)")?;
         } else if version == 3 {
             conn.execute_batch(
                 "ALTER TABLE sessions RENAME COLUMN working_dir TO subtitle_dir;
                  CREATE TABLE IF NOT EXISTS copies (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     session_id INTEGER REFERENCES sessions(id),
                      at INTEGER NOT NULL,
                      src_dir TEXT NOT NULL,
                      src_name TEXT NOT NULL,
@@ -184,12 +192,44 @@ impl StateDb {
                      dst_checksum TEXT NOT NULL,
                      unit_id TEXT
                  );
-                 CREATE INDEX IF NOT EXISTS idx_copies_dst     ON copies(dst_dir, dst_checksum);
-                 CREATE INDEX IF NOT EXISTS idx_copies_src     ON copies(src_dir, src_checksum);
-                 CREATE INDEX IF NOT EXISTS idx_copies_session ON copies(session_id);
-                 PRAGMA user_version = 4;",
+                 CREATE INDEX IF NOT EXISTS idx_copies_dst ON copies(dst_dir, dst_checksum);
+                 CREATE INDEX IF NOT EXISTS idx_copies_src ON copies(src_dir, src_checksum);
+                 PRAGMA user_version = 5;",
             )
-            .context("migrate: v3 -> v4 (rename working_dir, add copies)")?;
+            .context("migrate: v3 -> v5 (rename working_dir, add copies)")?;
+        } else if version == 4 {
+            // The always-NULL `copies.session_id` column is dead once an
+            // apply can no longer mix renames and copies; rebuild the
+            // table without it in a single transaction so an interruption
+            // cannot leave a half-migrated schema.
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE copies_new (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     at INTEGER NOT NULL,
+                     src_dir TEXT NOT NULL,
+                     src_name TEXT NOT NULL,
+                     src_checksum TEXT NOT NULL,
+                     dst_dir TEXT NOT NULL,
+                     dst_name TEXT NOT NULL,
+                     dst_checksum TEXT NOT NULL,
+                     unit_id TEXT
+                 );
+                 INSERT INTO copies_new
+                     (id, at, src_dir, src_name, src_checksum,
+                      dst_dir, dst_name, dst_checksum, unit_id)
+                     SELECT id, at, src_dir, src_name, src_checksum,
+                            dst_dir, dst_name, dst_checksum, unit_id
+                     FROM copies;
+                 DROP TABLE copies;
+                 ALTER TABLE copies_new RENAME TO copies;
+                 CREATE INDEX IF NOT EXISTS idx_copies_dst ON copies(dst_dir, dst_checksum);
+                 CREATE INDEX IF NOT EXISTS idx_copies_src ON copies(src_dir, src_checksum);
+                 DROP INDEX IF EXISTS idx_copies_session;
+                 PRAGMA user_version = 5;
+                 COMMIT;",
+            )
+            .context("migrate: v4 -> v5 (rebuild copies without session_id)")?;
         }
         Ok(())
     }
@@ -262,13 +302,12 @@ impl StateDb {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Append a copy event to the `copies` log. The log is append-only
-    /// and not undoable by design (reverting a copy would require deleting
-    /// the destination file, which is too dangerous to expose).
-    #[allow(clippy::too_many_arguments)]
+    /// Append a copy event to the `copies` log. The log is append-only,
+    /// carries no session linkage, and is not undoable by design
+    /// (reverting a copy would require deleting the destination file,
+    /// which is too dangerous to expose).
     pub fn record_copy(
         &self,
-        session_id: Option<i64>,
         src_dir: &Path,
         src_name: &str,
         src_checksum: &str,
@@ -280,11 +319,9 @@ impl StateDb {
         let at = now_epoch();
         self.conn.execute(
             "INSERT INTO copies
-                 (session_id, at, src_dir, src_name, src_checksum,
-                  dst_dir, dst_name, dst_checksum, unit_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (at, src_dir, src_name, src_checksum, dst_dir, dst_name, dst_checksum, unit_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                session_id,
                 at,
                 src_dir.display().to_string(),
                 src_name,
@@ -345,7 +382,7 @@ impl StateDb {
     /// identity, in time order. Mirrors [`Self::timeline_for`].
     pub fn copies_for_identity(&self, dir: &Path, checksum: &str) -> Result<Vec<CopyRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, at,
+            "SELECT id, at,
                     src_dir, src_name, src_checksum,
                     dst_dir, dst_name, dst_checksum, unit_id
              FROM copies
@@ -367,7 +404,7 @@ impl StateDb {
         }
         let placeholders = std::iter::repeat_n("?", dirs.len()).collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT id, session_id, at,
+            "SELECT id, at,
                     src_dir, src_name, src_checksum,
                     dst_dir, dst_name, dst_checksum, unit_id
              FROM copies
@@ -420,15 +457,14 @@ fn row_to_rename(row: &rusqlite::Row<'_>) -> rusqlite::Result<RenameRecord> {
 fn row_to_copy(row: &rusqlite::Row<'_>) -> rusqlite::Result<CopyRecord> {
     Ok(CopyRecord {
         id: row.get(0)?,
-        session_id: row.get(1)?,
-        at: row.get(2)?,
-        src_dir: row.get(3)?,
-        src_name: row.get(4)?,
-        src_checksum: row.get(5)?,
-        dst_dir: row.get(6)?,
-        dst_name: row.get(7)?,
-        dst_checksum: row.get(8)?,
-        unit_id: row.get(9)?,
+        at: row.get(1)?,
+        src_dir: row.get(2)?,
+        src_name: row.get(3)?,
+        src_checksum: row.get(4)?,
+        dst_dir: row.get(5)?,
+        dst_name: row.get(6)?,
+        dst_checksum: row.get(7)?,
+        unit_id: row.get(8)?,
     })
 }
 
@@ -459,6 +495,45 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.db");
         (StateDb::open(&path).unwrap(), path)
+    }
+
+    /// Create a unique temp dir holding an empty sqlite file whose
+    /// `PRAGMA user_version` is pre-stamped to `version`. The caller lays
+    /// down legacy tables via `Connection::open` first, then calls
+    /// [`StateDb::open`] to trigger migration. Returns `(dir, db_path)`
+    /// so the test can clean up `dir` at the end.
+    fn stamped_path(dir_name: &str, version: i64) -> (PathBuf, PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "sr_mig_{dir_name}_{}_{}_{}",
+            n,
+            std::process::id(),
+            std::thread::current().name().unwrap_or("main")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!("PRAGMA user_version = {version};")).unwrap();
+        drop(conn);
+        (dir, path)
+    }
+
+    fn assert_user_version(db: &StateDb, expected: i64) {
+        let v: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, expected);
+    }
+
+    fn table_columns(db: &StateDb, table: &str) -> Vec<String> {
+        db.conn
+            .prepare(&format!("SELECT name FROM pragma_table_info('{table}') ORDER BY cid"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
     }
 
     #[test]
@@ -562,102 +637,97 @@ mod tests {
 
     #[test]
     fn open_drops_v2_token_mappings_but_preserves_sessions() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "sr_v2_mig_{}_{}_{}",
-            std::process::id(),
-            n,
-            std::thread::current().name().unwrap_or("main")
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("state.db");
+        let (dir, path) = stamped_path("v2", 2);
         // Lay down a v2 database: real `sessions` row plus a vestigial
         // `token_mappings` table that should be dropped on open.
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE sessions (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 created_at INTEGER NOT NULL,
-                 working_dir TEXT,
-                 undo_of INTEGER REFERENCES sessions(id)
-             );
-             CREATE TABLE renames (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 session_id INTEGER NOT NULL REFERENCES sessions(id),
-                 dir TEXT NOT NULL,
-                 checksum TEXT NOT NULL,
-                 unit_id TEXT,
-                 old_name TEXT NOT NULL,
-                 new_name TEXT NOT NULL,
-                 at INTEGER NOT NULL
-             );
-             CREATE TABLE token_mappings (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 token TEXT NOT NULL,
-                 value TEXT NOT NULL,
-                 var TEXT NOT NULL,
-                 scope TEXT NOT NULL,
-                 created_at INTEGER NOT NULL
-             );
-             INSERT INTO sessions (id, created_at, working_dir, undo_of)
-                 VALUES (1, 1700000000, '/subs', NULL);
-             PRAGMA user_version = 2;",
-        )
-        .unwrap();
-        drop(conn);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     created_at INTEGER NOT NULL,
+                     working_dir TEXT,
+                     undo_of INTEGER REFERENCES sessions(id)
+                 );
+                 CREATE TABLE renames (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     session_id INTEGER NOT NULL REFERENCES sessions(id),
+                     dir TEXT NOT NULL,
+                     checksum TEXT NOT NULL,
+                     unit_id TEXT,
+                     old_name TEXT NOT NULL,
+                     new_name TEXT NOT NULL,
+                     at INTEGER NOT NULL
+                 );
+                 CREATE TABLE token_mappings (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     token TEXT NOT NULL,
+                     value TEXT NOT NULL,
+                     var TEXT NOT NULL,
+                     scope TEXT NOT NULL,
+                     created_at INTEGER NOT NULL
+                 );
+                 INSERT INTO sessions (id, created_at, working_dir, undo_of)
+                     VALUES (1, 1700000000, '/subs', NULL);",
+            )
+            .unwrap();
+        }
         let db = StateDb::open(&path).unwrap();
+        assert_user_version(&db, CURRENT_VERSION);
         let sessions = db.list_sessions().unwrap();
         assert_eq!(sessions.len(), 1, "v2 session row must survive migration");
         assert_eq!(sessions[0].subtitle_dir.as_deref(), Some("/subs"));
-        let _ = std::fs::remove_dir_all(&dir);
+        // v2 lands directly on the v5 shape: no session_id anywhere and
+        // the copies log is immediately usable.
+        assert!(!table_columns(&db, "copies").iter().any(|c| c == "session_id"));
+        db.record_copy(
+            Path::new("/subs"),
+            "orig.ass",
+            "cs1",
+            Path::new("/videos"),
+            "dst.ass",
+            "cs1",
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.copies_for_identity(Path::new("/videos"), "cs1").unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn open_v3_migrates_to_v4_with_copies() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "sr_v3_mig_{}_{}_{}",
-            std::process::id(),
-            n,
-            std::thread::current().name().unwrap_or("main")
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("state.db");
+    fn open_v3_migrates_to_v5_with_copies() {
+        let (dir, path) = stamped_path("v3", 3);
         // Lay down a v3 database with the legacy `working_dir` column name
-        // and no `copies` table; opening must rename the column and create
-        // the copies table + its 3 indexes.
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE sessions (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 created_at INTEGER NOT NULL,
-                 working_dir TEXT,
-                 undo_of INTEGER REFERENCES sessions(id)
-             );
-             CREATE TABLE renames (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 session_id INTEGER NOT NULL REFERENCES sessions(id),
-                 dir TEXT NOT NULL,
-                 checksum TEXT NOT NULL,
-                 unit_id TEXT,
-                 old_name TEXT NOT NULL,
-                 new_name TEXT NOT NULL,
-                 at INTEGER NOT NULL
-             );
-             INSERT INTO sessions (id, created_at, working_dir, undo_of)
-                 VALUES (1, 1700000000, '/subs', NULL);
-             PRAGMA user_version = 3;",
-        )
-        .unwrap();
-        drop(conn);
+        // and no `copies` table; opening must rename the column, create
+        // the session-free copies table + its identity indexes, and stamp
+        // v5 directly.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     created_at INTEGER NOT NULL,
+                     working_dir TEXT,
+                     undo_of INTEGER REFERENCES sessions(id)
+                 );
+                 CREATE TABLE renames (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     session_id INTEGER NOT NULL REFERENCES sessions(id),
+                     dir TEXT NOT NULL,
+                     checksum TEXT NOT NULL,
+                     unit_id TEXT,
+                     old_name TEXT NOT NULL,
+                     new_name TEXT NOT NULL,
+                     at INTEGER NOT NULL
+                 );
+                 INSERT INTO sessions (id, created_at, working_dir, undo_of)
+                     VALUES (1, 1700000000, '/subs', NULL);",
+            )
+            .unwrap();
+        }
 
         let db = StateDb::open(&path).unwrap();
+        assert_user_version(&db, CURRENT_VERSION);
 
         let has_working: i64 = db
             .conn
@@ -693,26 +763,149 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
                  WHERE type='index' AND tbl_name='copies'
-                   AND name IN ('idx_copies_dst', 'idx_copies_src', 'idx_copies_session')",
+                   AND name IN ('idx_copies_dst', 'idx_copies_src')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(index_count, 3, "all 3 copies indexes must exist");
+        assert_eq!(index_count, 2, "both copies identity indexes must exist");
+
+        assert!(!table_columns(&db, "copies").iter().any(|c| c == "session_id"));
 
         // The pre-existing session must still be queryable via the new column.
         let sessions = db.list_sessions().unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].subtitle_dir.as_deref(), Some("/subs"));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        // The freshly-created copies log is immediately usable.
+        db.record_copy(
+            Path::new("/subs"),
+            "orig.ass",
+            "cs1",
+            Path::new("/videos"),
+            "dst.ass",
+            "cs1",
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.copies_for_identity(Path::new("/videos"), "cs1").unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
+    #[test]
+    fn migrate_v4_rebuilds_copies_without_session() {
+        let (dir, path) = stamped_path("v4", 4);
+        // Lay down a v4 database whose copies table still carries the
+        // vestigial session_id column, with one row that even references
+        // a real session — the rebuild drops the linkage value but must
+        // keep every identity field.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     created_at INTEGER NOT NULL,
+                     subtitle_dir TEXT,
+                     undo_of INTEGER REFERENCES sessions(id)
+                 );
+                 CREATE TABLE renames (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     session_id INTEGER NOT NULL REFERENCES sessions(id),
+                     dir TEXT NOT NULL,
+                     checksum TEXT NOT NULL,
+                     unit_id TEXT,
+                     old_name TEXT NOT NULL,
+                     new_name TEXT NOT NULL,
+                     at INTEGER NOT NULL
+                 );
+                 CREATE TABLE copies (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     session_id INTEGER REFERENCES sessions(id),
+                     at INTEGER NOT NULL,
+                     src_dir TEXT NOT NULL,
+                     src_name TEXT NOT NULL,
+                     src_checksum TEXT NOT NULL,
+                     dst_dir TEXT NOT NULL,
+                     dst_name TEXT NOT NULL,
+                     dst_checksum TEXT NOT NULL,
+                     unit_id TEXT
+                 );
+                 INSERT INTO sessions (id, created_at, subtitle_dir, undo_of)
+                     VALUES (1, 1700000000, '/subs', NULL);
+                 INSERT INTO copies (id, session_id, at, src_dir, src_name, src_checksum,
+                                     dst_dir, dst_name, dst_checksum, unit_id)
+                     VALUES (7, 1, 1_700_000_010, '/subs', 'orig.ass', 'cs1',
+                             '/videos', 'S01E01.ass', 'cs1', 'u1');
+                 CREATE INDEX idx_copies_dst ON copies(dst_dir, dst_checksum);
+                 CREATE INDEX idx_copies_src ON copies(src_dir, src_checksum);
+                 CREATE INDEX idx_copies_session ON copies(session_id);",
+            )
+            .unwrap();
+        }
+
+        let db = StateDb::open(&path).unwrap();
+
+        assert_user_version(&db, CURRENT_VERSION);
+        let cols = table_columns(&db, "copies");
+        assert!(!cols.iter().any(|c| c == "session_id"), "session_id column must be gone");
+
+        let rows = db.copies_for_identity(Path::new("/videos"), "cs1").unwrap();
+        assert_eq!(rows.len(), 1, "the sample copy row must survive the rebuild");
+        let c = &rows[0];
+        assert_eq!(c.id, 7, "row id preserved by the rebuild");
+        assert_eq!(c.at, 1_700_000_010);
+        assert_eq!(c.src_dir, "/subs");
+        assert_eq!(c.src_name, "orig.ass");
+        assert_eq!(c.src_checksum, "cs1");
+        assert_eq!(c.dst_dir, "/videos");
+        assert_eq!(c.dst_name, "S01E01.ass");
+        assert_eq!(c.dst_checksum, "cs1");
+        assert_eq!(c.unit_id.as_deref(), Some("u1"));
+
+        let stale_idx: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_copies_session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_idx, 0, "idx_copies_session must be dropped");
+        let live_idx: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='copies'
+                   AND name IN ('idx_copies_dst', 'idx_copies_src')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_idx, 2, "identity indexes rebuilt on the new table");
+
+        // The log remains appendable under the new column set.
+        db.record_copy(
+            Path::new("/subs"),
+            "x.ass",
+            "cs9",
+            Path::new("/videos"),
+            "y.ass",
+            "cs9",
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.copies_for_identity(Path::new("/videos"), "cs9").unwrap().len(), 1);
+
+        // The one-shot pre-migration snapshot exists next to the database.
+        assert!(dir.join("state.db.bak-v4").exists(), ".bak-v4 snapshot must be written");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn record_copy_and_query_by_dst() {
         let (db, path) = tmp_db();
         let id = db
             .record_copy(
-                None,
                 Path::new("/subs"),
                 "orig.ass",
                 "cs1",

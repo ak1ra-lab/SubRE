@@ -592,7 +592,8 @@ impl App {
         }
     }
 
-    /// Record a successful copy op as a `copies` log row (no session).
+    /// Record a successful copy op as an append-only `copies` identity
+    /// log row (no session linkage exists in the schema).
     fn record_copy_for_op(&mut self, op: &PlannedOp) {
         let Some(src_dir) = op.subtitle.path.parent() else {
             return;
@@ -621,7 +622,6 @@ impl App {
             }
         };
         if let Err(e) = self.state.record_copy(
-            None,
             src_dir,
             src_name,
             &src_cs,
