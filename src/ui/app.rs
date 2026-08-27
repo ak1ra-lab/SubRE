@@ -682,16 +682,13 @@ impl App {
             stored.clone()
         };
 
-        let undo_session = match self.state.create_undo_session(session_id) {
-            Ok(id) => id,
-            Err(e) => {
-                self.push_status(format!("history undo session failed: {e}"));
-                return;
-            }
-        };
-
+        // The undo session is created lazily on the first successful unit:
+        // a fully-skipped or fully-failed rollback leaves no empty
+        // undo-of row behind.
+        let mut undo_session: Option<i64> = None;
         let mut ok = 0usize;
         let mut bad = 0usize;
+        let mut failures: Vec<String> = Vec::new();
         for (i, unit) in units.iter().enumerate() {
             if !selection[i] {
                 continue;
@@ -707,9 +704,22 @@ impl App {
                 .collect();
             match rollback_unit(&items) {
                 RollbackOutcome::Ok => {
+                    let sid = match undo_session {
+                        Some(sid) => sid,
+                        None => match self.state.create_undo_session(session_id) {
+                            Ok(id) => {
+                                undo_session = Some(id);
+                                id
+                            }
+                            Err(e) => {
+                                self.push_status(format!("history undo session failed: {e}"));
+                                break;
+                            }
+                        },
+                    };
                     for r in unit {
                         if let Err(e) = self.state.record_rename(
-                            undo_session,
+                            sid,
                             Path::new(&r.dir),
                             &r.checksum,
                             r.unit_id.as_deref(),
@@ -721,8 +731,20 @@ impl App {
                     }
                     ok += 1;
                 }
-                _ => bad += 1,
+                outcome @ (RollbackOutcome::DstChanged(_)
+                | RollbackOutcome::SrcOccupied(_)
+                | RollbackOutcome::Io(_)) => {
+                    bad += 1;
+                    let first = &unit[0];
+                    failures.push(format!(
+                        "Undo failed: {}/{} -> {} ({outcome})",
+                        first.dir, first.old_name, first.new_name
+                    ));
+                }
             }
+        }
+        for line in failures {
+            self.push_status(line);
         }
         self.push_status(format!("Undo: {ok} unit(s) ok, {bad} failed"));
         self.refresh_match_and_plan();

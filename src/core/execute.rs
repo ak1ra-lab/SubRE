@@ -167,6 +167,17 @@ pub enum RollbackOutcome {
     Io(String),
 }
 
+impl std::fmt::Display for RollbackOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ok => f.write_str("ok"),
+            Self::DstChanged(detail) => write!(f, "dest changed or missing: {detail}"),
+            Self::SrcOccupied(path) => write!(f, "original name now occupied: {path}"),
+            Self::Io(err) => write!(f, "io error: {err}"),
+        }
+    }
+}
+
 /// Roll back a whole unit atomically: first validate every member (the
 /// file is still at `new_name` with a matching checksum, and `old_name`
 /// is free), then rename each member back to `old_name`. Any validation
@@ -348,6 +359,24 @@ mod tests {
         assert_eq!(std::fs::read(&f).unwrap(), b"payload");
         assert_eq!(std::fs::metadata(&f).unwrap().len(), 7);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_outcome_display_is_human_readable() {
+        assert_eq!(RollbackOutcome::Ok.to_string(), "ok");
+        assert_eq!(
+            RollbackOutcome::DstChanged("dst checksum deadbeef != recorded cafebeef".into())
+                .to_string(),
+            "dest changed or missing: dst checksum deadbeef != recorded cafebeef"
+        );
+        assert_eq!(
+            RollbackOutcome::SrcOccupied("/subs/orig.ass".into()).to_string(),
+            "original name now occupied: /subs/orig.ass"
+        );
+        assert_eq!(
+            RollbackOutcome::Io("permission denied".into()).to_string(),
+            "io error: permission denied"
+        );
     }
 
     #[test]
