@@ -14,6 +14,7 @@
 //!     video explicitly.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -288,37 +289,78 @@ impl Matcher {
         MatchResult { groups }
     }
 
-    /// Manually attach a subtitle to a video (by index in the result).
-    pub fn manual_attach(
+    /// Manually attach the subtitle file at `sub_path` to the video file
+    /// at `video_path`. The subtitle is moved out of whichever group
+    /// currently holds it — sibling subtitles (e.g. the other half of an
+    /// `.idx`+`.sub` unit) stay put — and pushed into the target video's
+    /// group, which is marked `manual`. Returns `true` when the
+    /// attachment happened; `false` when either path is absent from the
+    /// result (in which case the subtitle is left wherever it was).
+    pub fn attach_after_match(
         &self,
         result: &mut MatchResult,
-        video_index: usize,
-        subtitle_index: usize,
-    ) {
-        let video = result.groups.get(video_index).and_then(|g| g.video.clone());
-        let subtitle = result.groups.get(subtitle_index).and_then(|g| g.subtitles.first().cloned());
-        if let (Some(_video), Some(subtitle)) = (video, subtitle) {
-            // Remove the subtitle from its current group.
-            result.groups[subtitle_index].subtitles.clear();
-            // Attach to the video group.
-            result.groups[video_index].subtitles.push(subtitle);
-            result.groups[video_index].manual = true;
+        sub_path: &Path,
+        video_path: &Path,
+    ) -> bool {
+        let held = result.groups.iter().any(|g| {
+            g.video.as_ref().is_some_and(|v| v.path == video_path)
+                && g.subtitles.iter().any(|s| s.path == sub_path)
+        });
+        if held {
+            return false;
         }
+        // Validate the target BEFORE moving anything: a missing target
+        // must never strand the subtitle out of the result.
+        let Some(target_idx) = result
+            .groups
+            .iter()
+            .position(|g| g.video.as_ref().is_some_and(|v| v.path == video_path))
+        else {
+            return false;
+        };
+        let Some(sub) = result.groups.iter_mut().find_map(|g| {
+            g.subtitles.iter().position(|s| s.path == sub_path).map(|i| g.subtitles.remove(i))
+        }) else {
+            return false;
+        };
+        // A subtitle-only group drained by this move contributes nothing
+        // to any iterator; drop it. Video-bearing groups are always kept
+        // (an emptied paired group degrades to an unmatched video).
+        result.groups.retain(|g| !(g.video.is_none() && g.subtitles.is_empty()));
+
+        let target = &mut result.groups[target_idx];
+        target.subtitles.push(sub);
+        target.subtitles.sort_by(|a, b| a.stem.cmp(&b.stem));
+        target.manual = true;
+        true
     }
 
-    /// Detach a subtitle from a video.
-    pub fn manual_detach(
-        &self,
-        result: &mut MatchResult,
-        video_index: usize,
-        subtitle_index: usize,
-    ) {
-        if let Some(group) = result.groups.get_mut(video_index)
-            && subtitle_index < group.subtitles.len()
-        {
-            group.subtitles.remove(subtitle_index);
-            group.manual = true;
+    /// Detach the subtitle file at `sub_path` from its paired video into
+    /// its own unmatched group. Idempotent: a subtitle that is already
+    /// unmatched is left alone and `false` is returned.
+    pub fn detach_after_match(&self, result: &mut MatchResult, sub_path: &Path) -> bool {
+        let Some(holder) =
+            result.groups.iter().position(|g| g.subtitles.iter().any(|s| s.path == sub_path))
+        else {
+            return false;
+        };
+        if result.groups[holder].video.is_none() {
+            return false;
         }
+        let sub = {
+            let group = &mut result.groups[holder];
+            group.manual = true;
+            let i = group.subtitles.iter().position(|s| s.path == sub_path).unwrap();
+            group.subtitles.remove(i)
+        };
+        let synthetic = EpisodeKey::Text(format!("__unmatched_sub::detached:{}", sub.stem));
+        result.groups.push(PairGroup {
+            video: None,
+            subtitles: vec![sub],
+            key: synthetic,
+            manual: false,
+        });
+        true
     }
 }
 
@@ -562,29 +604,110 @@ mod tests {
     }
 
     #[test]
-    fn manual_attach_and_detach() {
+    fn attach_moves_single_sub_keeping_siblings() {
         let m = Matcher::new();
         let v = vec![entry("Show - 01.mkv"), entry("Show - 02.mkv")];
-        let s = vec![entry("Show.S01E01.chs.ass"), entry("Show.S01E03.chs.ass")];
+        let s = vec![entry("Show.S01E01.idx"), entry("Show.S01E01.sub"), entry("Show.S01E01.cht")];
         let mut r = m.match_files(&v, &s, None, None);
-        // Attach the unmatched subtitle (S01E03) to the video "Show - 02".
-        // Find the unmatched-subtitle group and the "Show - 02" video group
-        // by inspection.
-        let sub_idx = r
+        // Auto-match puts all three subtitles on Show - 01; Show - 02 is
+        // an unmatched video.
+        let pos_01 = r
             .groups
             .iter()
-            .position(|g| g.video.is_none() && !g.subtitles.is_empty())
-            .expect("unmatched subtitle group");
-        let video_idx = r
+            .position(|g| g.video.as_ref().is_some_and(|f| f.stem.contains("01")))
+            .unwrap();
+        assert_eq!(r.groups[pos_01].subtitles.len(), 3);
+
+        // Attaching only the .cht subtitle must not disturb its siblings.
+        assert!(m.attach_after_match(
+            &mut r,
+            Path::new("Show.S01E01.cht"),
+            Path::new("Show - 02.mkv")
+        ));
+        let g_01 = &r.groups[pos_01];
+        assert_eq!(
+            g_01.subtitles.iter().map(|s| s.ext.as_str()).collect::<Vec<_>>(),
+            vec!["idx", "sub"],
+            "idx/sub siblings stay in the original group"
+        );
+        let g_02 = r
             .groups
             .iter()
-            .position(|g| g.video.as_ref().is_some_and(|v| v.stem.contains("02")))
-            .expect("video 02 group");
-        m.manual_attach(&mut r, video_idx, sub_idx);
-        // After attach: target group has 1 subtitle, source has 0.
-        assert_eq!(r.groups[video_idx].subtitles.len(), 1);
-        assert_eq!(r.groups[sub_idx].subtitles.len(), 0);
-        assert!(r.groups[video_idx].manual);
+            .find(|g| g.video.as_ref().is_some_and(|f| f.stem.contains("02")))
+            .unwrap();
+        assert_eq!(g_02.subtitles.iter().map(|s| s.ext.as_str()).collect::<Vec<_>>(), vec!["cht"]);
+        assert!(g_02.manual);
+    }
+
+    #[test]
+    fn attach_unknown_sub_or_video_is_noop() {
+        let m = Matcher::new();
+        let v = vec![entry("Show - 01.mkv"), entry("Show - 02.mkv")];
+        let s = vec![entry("Show.S01E01.chs.ass"), entry("Show.S01E02.cht.ass")];
+        let mut r = m.match_files(&v, &s, None, None);
+        // Unknown paths on either side must be rejected without side effects.
+        assert!(!m.attach_after_match(&mut r, Path::new("nope.ass"), Path::new("Show - 02.mkv")));
+        assert!(!m.attach_after_match(
+            &mut r,
+            Path::new("Show.S01E01.chs.ass"),
+            Path::new("ghost.mkv")
+        ));
+        let total_subs: usize = r.groups.iter().map(|g| g.subtitles.len()).sum();
+        assert_eq!(total_subs, 2, "subtitles unchanged after rejected attaches");
+        assert_eq!(r.unmatched_videos().count(), 0);
+        assert_eq!(r.unmatched_subtitles().count(), 0);
+    }
+
+    #[test]
+    fn detach_puts_sub_unmatched_and_is_idempotent() {
+        let m = Matcher::new();
+        let v = vec![entry("Show - 01.mkv")];
+        let s = vec![entry("Show.S01E01.chs.ass"), entry("Show.S01E01.cht.ass")];
+        let mut r = m.match_files(&v, &s, None, None);
+        assert_eq!(r.groups[0].subtitles.len(), 2);
+        let ok = m.detach_after_match(&mut r, Path::new("Show.S01E01.cht.ass"));
+        assert!(ok, "groups: {:#?}", r.groups);
+        assert_eq!(r.groups[0].subtitles.len(), 1);
+        assert!(r.groups[0].manual);
+        let unmatched: Vec<&FileEntry> = r.unmatched_subtitles().collect();
+        assert_eq!(unmatched.len(), 1);
+        assert!(unmatched[0].stem.contains("cht"));
+
+        // Second detach is a no-op (already unmatched), no duplicate rows.
+        assert!(!m.detach_after_match(&mut r, Path::new("Show.S01E01.cht.ass")));
+        assert_eq!(r.unmatched_subtitles().count(), 1);
+        let total_subs: usize = r.groups.iter().map(|g| g.subtitles.len()).sum();
+        assert_eq!(total_subs, 2, "no subtitle lost or duplicated");
+    }
+
+    #[test]
+    fn override_replay_chain_attach_reattach_detach() {
+        let m = Matcher::new();
+        let v = vec![entry("Show - 01.mkv"), entry("Show - 02.mkv"), entry("Show - 03.mkv")];
+        let s = vec![entry("Show.S01E01.chs.ass")]; // auto-pairs to 01
+        let sub_path = Path::new("Show.S01E01.chs.ass");
+
+        let mut r = m.match_files(&v, &s, None, None);
+        let count_in = |r: &MatchResult, needle: &str| {
+            r.groups
+                .iter()
+                .find(|g| g.video.as_ref().is_some_and(|f| f.stem.contains(needle)))
+                .map_or(0, |g| g.subtitles.len())
+        };
+        assert_eq!(count_in(&r, "01"), 1);
+        assert_eq!(count_in(&r, "02"), 0);
+
+        // attach -> re-attach -> detach, as a replay sequence would.
+        assert!(m.attach_after_match(&mut r, sub_path, Path::new("Show - 02.mkv")));
+        assert_eq!(count_in(&r, "01"), 0);
+        assert_eq!(count_in(&r, "02"), 1);
+        assert!(m.attach_after_match(&mut r, sub_path, Path::new("Show - 03.mkv")));
+        assert_eq!(count_in(&r, "02"), 0);
+        assert_eq!(count_in(&r, "03"), 1);
+        assert!(m.detach_after_match(&mut r, sub_path));
+        assert_eq!(count_in(&r, "03"), 0);
+        assert_eq!(r.unmatched_subtitles().count(), 1);
+        assert!(!m.detach_after_match(&mut r, sub_path));
     }
 
     #[test]

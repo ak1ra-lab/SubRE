@@ -66,6 +66,9 @@ struct RefreshRequest {
     subtitle_regex: Option<String>,
     naming: NamingConfig,
     action_mode: ActionMode,
+    /// Manual pairing overrides replayed after matching, before plan
+    /// generation.
+    overrides: HashMap<PathBuf, OverrideTarget>,
     epoch: u64,
 }
 
@@ -87,6 +90,24 @@ struct RefreshResult {
 pub enum TimelineEntry {
     Rename(RenameRecord),
     Copy(CopyRecord),
+}
+
+/// Payload carried by an active subtitle drag (path of the dragged file).
+#[derive(Debug, Clone)]
+pub struct SubtitleRef {
+    pub path: PathBuf,
+}
+
+/// A manual pairing decision for one subtitle, replayed onto
+/// every fresh match result so edits to template/suffix/tabs do not lose
+/// it. Session-scoped: never persisted to config, and entries referencing
+/// files no longer loaded are pruned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverrideTarget {
+    /// Pair this subtitle with the video at the given path.
+    Attached(PathBuf),
+    /// Leave this subtitle unpaired regardless of auto-matching.
+    Detached,
 }
 
 impl TimelineEntry {
@@ -187,6 +208,11 @@ pub struct App {
     /// side (content collision), for which history is not attributed.
     pub checksum_collision: Vec<(PathBuf, String)>,
 
+    /// Manual pairing overrides (subtitle path → attach-to / detach),
+    /// replayed onto every fresh match. Session-scoped; pruned whenever
+    /// entries reference files no longer loaded.
+    pub manual_overrides: HashMap<PathBuf, OverrideTarget>,
+
     /// Transient view state for the History tab (not persisted).
     pub history_view: HistoryView,
 
@@ -240,6 +266,7 @@ impl App {
             active_tab: ActiveTab::default(),
             sidebar_width: None,
             history_hint: Vec::new(),
+            manual_overrides: HashMap::new(),
             undo_selection: HashMap::new(),
             checksum_collision: Vec::new(),
             history_view: HistoryView::default(),
@@ -328,6 +355,7 @@ impl App {
     /// thread; results are applied by [`App::drain_refresh`] when they
     /// arrive. Latest-wins: a newer request supersedes an older one.
     pub fn refresh_match_and_plan(&mut self) {
+        self.prune_manual_overrides();
         self.refresh_epoch = self.refresh_epoch.wrapping_add(1);
         let request = RefreshRequest {
             videos: self.video_entries.clone(),
@@ -336,6 +364,7 @@ impl App {
             subtitle_regex: non_empty(&self.subtitle_regex_input),
             naming: self.current_naming_config(),
             action_mode: self.action_mode,
+            overrides: self.manual_overrides.clone(),
             epoch: self.refresh_epoch,
         };
         if self.refresh_tx.send(request).is_ok() {
@@ -414,6 +443,55 @@ impl App {
         }
         entries.sort_by_key(TimelineEntry::at);
         self.history_hint = entries;
+    }
+
+    /// Drop override entries whose subtitle or target video is no longer
+    /// loaded. Cheap; runs before each refresh snapshot is taken.
+    fn prune_manual_overrides(&mut self) {
+        let video_paths: Vec<PathBuf> = self.video_entries.iter().map(|e| e.path.clone()).collect();
+        let sub_paths: Vec<PathBuf> =
+            self.subtitle_entries.iter().map(|e| e.path.clone()).collect();
+        self.manual_overrides.retain(|sub, target| {
+            let sub_alive = sub_paths.contains(sub);
+            let target_alive = match target {
+                OverrideTarget::Attached(v) => video_paths.contains(v),
+                OverrideTarget::Detached => true,
+            };
+            sub_alive && target_alive
+        });
+    }
+
+    /// Record a manual attach (drag-drop) and re-run matching. Dropping a
+    /// subtitle onto the video it is already paired with is a no-op that
+    /// never enters the override map.
+    fn attach_override(&mut self, sub_path: PathBuf, video_path: PathBuf) {
+        if matches!(self.manual_overrides.get(&sub_path), Some(OverrideTarget::Attached(v)) if *v == video_path)
+        {
+            return;
+        }
+        let already_paired = self.match_result.as_ref().is_some_and(|r| {
+            r.groups.iter().any(|g| {
+                g.video.as_ref().is_some_and(|v| v.path == video_path)
+                    && g.subtitles.iter().any(|s| s.path == sub_path)
+            })
+        });
+        if already_paired && !self.manual_overrides.contains_key(&sub_path) {
+            // Auto-pairing already produced this exact pairing.
+            return;
+        }
+        self.manual_overrides.insert(sub_path, OverrideTarget::Attached(video_path));
+        self.push_status("配对已手动指定。");
+        self.refresh_match_and_plan();
+    }
+
+    /// Record a manual detach and re-run matching; idempotent.
+    fn detach_override(&mut self, sub_path: PathBuf) {
+        if matches!(self.manual_overrides.get(&sub_path), Some(OverrideTarget::Detached)) {
+            return;
+        }
+        self.manual_overrides.insert(sub_path, OverrideTarget::Detached);
+        self.push_status("配对已解除。");
+        self.refresh_match_and_plan();
     }
 
     fn current_naming_config(&self) -> NamingConfig {
@@ -780,6 +858,7 @@ impl App {
             self.subtitle_entries.clear();
             self.unknown_entries.clear();
             self.history_hint.clear();
+            self.manual_overrides.clear();
             self.refresh_match_and_plan();
         }
     }
@@ -822,6 +901,7 @@ impl App {
             }
             if ui.button("🗑 Clear").clicked() {
                 self.video_entries.clear();
+                self.manual_overrides.retain(|_, t| !matches!(t, OverrideTarget::Attached(_)));
                 self.refresh_match_and_plan();
             }
         });
@@ -853,6 +933,7 @@ impl App {
             }
             if ui.button("🗑 Clear").clicked() {
                 self.subtitle_entries.clear();
+                self.manual_overrides.clear();
                 self.refresh_match_and_plan();
             }
         });
@@ -1082,6 +1163,32 @@ impl App {
                                     } else {
                                         ui.label(path_label(v));
                                     }
+
+                                    // Drop target: dragging a subtitle here
+                                    // re-pairs it with this video.
+                                    let ctx = ui.ctx().clone();
+                                    let hit = ui.allocate_rect(
+                                        ui.available_rect_before_wrap(),
+                                        egui::Sense::hover(),
+                                    );
+                                    let dragging = egui::DragAndDrop::payload::<SubtitleRef>(&ctx);
+                                    let hot = hit.contains_pointer() && dragging.is_some();
+                                    if hot {
+                                        ui.painter().rect_filled(
+                                            hit.rect,
+                                            4.0,
+                                            egui::Color32::from_rgba_unmultiplied(
+                                                0x4C, 0xAF, 0x50, 0x40,
+                                            ),
+                                        );
+                                    }
+                                    if hot
+                                        && ui.input(|i| i.pointer.any_released())
+                                        && let Some(sub) =
+                                            egui::DragAndDrop::take_payload::<SubtitleRef>(&ctx)
+                                    {
+                                        self.attach_override(sub.path.clone(), v.path.clone());
+                                    }
                                 } else {
                                     prev_video = None;
                                     ui.label("—");
@@ -1090,12 +1197,33 @@ impl App {
                             row.col(|ui| {
                                 if let Some(sub) = subtitle {
                                     ui.horizontal(|ui| {
-                                        ui.label(path_label(sub));
+                                        let label = ui.label(path_label(sub));
+                                        // Drag source: drag the subtitle
+                                        // label onto any video cell.
+                                        let src = ui
+                                            .interact(
+                                                label.rect,
+                                                egui::Id::new(("sub_drag", &sub.path)),
+                                                egui::Sense::click_and_drag(),
+                                            )
+                                            .on_hover_cursor(egui::CursorIcon::Grab);
+                                        if src.drag_started() {
+                                            egui::DragAndDrop::set_payload(
+                                                ui.ctx(),
+                                                SubtitleRef { path: sub.path.clone() },
+                                            );
+                                            self.push_status("拖到目标视频行以重新配对。");
+                                        }
                                         // Per-row "remove" button: drop this
                                         // subtitle from the loaded set.
                                         if ui.small_button("x").clicked() {
                                             self.subtitle_entries.retain(|e| e.path != sub.path);
+                                            self.manual_overrides.remove(&sub.path);
                                             self.refresh_match_and_plan();
+                                        }
+                                        if video.is_some() && ui.small_button("⛓ 解除").clicked()
+                                        {
+                                            self.detach_override(sub.path.clone());
                                         }
                                     });
                                 } else {
@@ -1118,25 +1246,70 @@ impl App {
                 }
             });
 
+        // Sweep a payload left dangling when the drag ended outside every
+        // drop target; targets consume it via take_payload.
+        if ui.input(|i| i.pointer.any_released())
+            && egui::DragAndDrop::has_payload_of_type::<SubtitleRef>(ui.ctx())
+        {
+            egui::DragAndDrop::clear_payload(ui.ctx());
+        }
+
         ui.collapsing("Unmatched / unknown", |ui| {
-            if let Some(result) = &self.match_result {
-                let unmatched_v: Vec<&FileEntry> = result.unmatched_videos().collect();
-                let unmatched_s: Vec<&FileEntry> = result.unmatched_subtitles().collect();
-                ui.label(format!(
-                    "Unmatched videos: {} · Unmatched subtitles: {} · Unknown extensions: {}",
-                    unmatched_v.len(),
-                    unmatched_s.len(),
-                    self.unknown_entries.len()
-                ));
-                for v in unmatched_v {
+            // Owned copies: the interactive rows below mutate `self`
+            // (attach/detach overrides), so borrowed iterators over
+            // `self.match_result` cannot outlive the read.
+            let unmatched_v: Vec<FileEntry> = self
+                .match_result
+                .as_ref()
+                .map_or_else(Vec::new, |r| r.unmatched_videos().cloned().collect());
+            let unmatched_s: Vec<FileEntry> = self
+                .match_result
+                .as_ref()
+                .map_or_else(Vec::new, |r| r.unmatched_subtitles().cloned().collect());
+            ui.label(format!(
+                "Unmatched videos: {} · Unmatched subtitles: {} · Unknown extensions: {}",
+                unmatched_v.len(),
+                unmatched_s.len(),
+                self.unknown_entries.len()
+            ));
+            for v in &unmatched_v {
+                let ctx = ui.ctx().clone();
+                ui.horizontal(|ui| {
                     ui.colored_label(egui::Color32::YELLOW, format!("  V  {}", path_label(v)));
-                }
-                for s in unmatched_s {
+                    // Unpaired videos stay valid manual targets.
+                    let hit =
+                        ui.allocate_rect(ui.available_rect_before_wrap(), egui::Sense::hover());
+                    let dragging = egui::DragAndDrop::payload::<SubtitleRef>(&ctx);
+                    if hit.contains_pointer() && dragging.is_some() {
+                        ui.painter().rect_filled(
+                            hit.rect,
+                            4.0,
+                            egui::Color32::from_rgba_unmultiplied(0x4C, 0xAF, 0x50, 0x40),
+                        );
+                        if ui.input(|i| i.pointer.any_released())
+                            && let Some(sub) = egui::DragAndDrop::take_payload::<SubtitleRef>(&ctx)
+                        {
+                            self.attach_override(sub.path.clone(), v.path.clone());
+                        }
+                    }
+                });
+            }
+            for s in &unmatched_s {
+                let label =
                     ui.colored_label(egui::Color32::YELLOW, format!("  S  {}", path_label(s)));
+                // Unpaired subtitles remain draggable sources.
+                let src = ui.interact(
+                    label.rect,
+                    egui::Id::new(("sub_drag_unmatched", &s.path)),
+                    egui::Sense::click_and_drag(),
+                );
+                if src.on_hover_cursor(egui::CursorIcon::Grab).drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), SubtitleRef { path: s.path.clone() });
+                    self.push_status("拖到目标视频行以重新配对。");
                 }
-                for u in &self.unknown_entries {
-                    ui.label(format!("  ?  {}", path_label(u)));
-                }
+            }
+            for u in &self.unknown_entries {
+                ui.label(format!("  ?  {}", path_label(u)));
             }
         });
     }
@@ -1564,12 +1737,37 @@ fn spawn_refresh_worker() -> (mpsc::Sender<RefreshRequest>, mpsc::Receiver<Refre
     std::thread::spawn(move || {
         let mut cache = ChecksumCache::new();
         while let Ok(req) = req_rx.recv() {
-            let result = Matcher::new().match_files(
+            let matcher = Matcher::new();
+            let mut result = matcher.match_files(
                 &req.videos,
                 &req.subtitles,
                 req.video_regex.as_deref(),
                 req.subtitle_regex.as_deref(),
             );
+            // Replay manual pairing overrides so they survive the
+            // recomputed match: attach to the recorded video (falling
+            // back to detach when that video vanished), or detach.
+            for (sub_path, target) in &req.overrides {
+                match target {
+                    OverrideTarget::Attached(video_path) => {
+                        let video_present = result
+                            .groups
+                            .iter()
+                            .any(|g| g.video.as_ref().is_some_and(|v| v.path == *video_path));
+                        if video_present {
+                            matcher.attach_after_match(&mut result, sub_path, video_path);
+                        } else {
+                            matcher.detach_after_match(&mut result, sub_path);
+                        }
+                    }
+                    OverrideTarget::Detached => {
+                        matcher.detach_after_match(&mut result, sub_path);
+                    }
+                }
+            }
+            if !req.overrides.is_empty() {
+                result.groups.sort_by(|a, b| a.key.cmp(&b.key));
+            }
             let mut identities = Vec::new();
             for sub in &req.subtitles {
                 if let Some(dir) = sub.path.parent()
