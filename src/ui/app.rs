@@ -98,10 +98,9 @@ impl TimelineEntry {
     }
 }
 
-/// Transient view state for the History popup. `scope_current_only`,
-/// `search` and `show_older_offset` are intentionally NOT persisted across
-/// popup close/open: they are query parameters, not preferences. Only the
-/// matching `copies_expanded` toggle on `App` survives.
+/// Transient view state for the History tab. These fields live for the
+/// whole process run — tab switches do NOT reset them; nothing here is
+/// written to config, so a restart lands back on the defaults.
 #[derive(Debug, Clone)]
 pub struct HistoryView {
     pub scope_current_only: bool,
@@ -188,11 +187,12 @@ pub struct App {
     /// side (content collision), for which history is not attributed.
     pub checksum_collision: Vec<(PathBuf, String)>,
 
-    /// Transient view state for the History popup (not persisted).
+    /// Transient view state for the History tab (not persisted).
     pub history_view: HistoryView,
 
-    /// Whether the History popup's copies fold-out is expanded. Persisted
-    /// across popup close/open — this is a real preference.
+    /// Whether the History tab's copies fold-out is expanded. Kept across
+    /// tab switches for the lifetime of the process but never written to
+    /// config, so a restart folds it again.
     pub copies_expanded: bool,
 
     // Async refresh plumbing.
@@ -1266,11 +1266,15 @@ impl App {
         let scope_empty = scope_dirs.is_empty();
         // When the sidebar holds nothing, force `scope_current_only = false`
         // for this render so the user sees everything (and the checkbox is
-        // unchecked). The transient field is reset to default on next
-        // open anyway.
+        // unchecked). The field itself is not reset anywhere; only a restart
+        // brings back the default.
         if scope_empty {
             self.history_view.scope_current_only = false;
         }
+        // One source of truth for "what does the checkbox currently select":
+        // shared by the sessions list and the copies foldout below.
+        let effective_scope =
+            effective_scope_dirs(self.history_view.scope_current_only, &scope_dirs);
 
         ui.horizontal(|ui| {
             ui.add_enabled(
@@ -1313,9 +1317,7 @@ impl App {
         };
         let sessions: Vec<SessionRecord> = sessions_all
             .iter()
-            .filter(|s| {
-                session_matches(&self.state, s, &self.history_view, &scope_dirs, scope_empty)
-            })
+            .filter(|s| session_matches(&self.state, s, &self.history_view, effective_scope))
             .take(session_limit)
             .cloned()
             .collect();
@@ -1376,17 +1378,17 @@ impl App {
 
         let filtered_total = sessions_all
             .iter()
-            .filter(|s| {
-                session_matches(&self.state, s, &self.history_view, &scope_dirs, scope_empty)
-            })
+            .filter(|s| session_matches(&self.state, s, &self.history_view, effective_scope))
             .count();
         let remaining = filtered_total.saturating_sub(session_limit);
         if remaining > 0 && ui.button(format!("Show older {remaining} more")).clicked() {
             self.history_view.show_older_offset += self.history_view.page_size;
         }
 
-        // Copies foldout.
-        let copies = match self.state.copies_in_dirs(&scope_dirs) {
+        // Copies foldout. Its scope follows the tab's effective filter:
+        // checkbox on with loaded dirs shows only those dirs, everything
+        // else (unchecked or empty sidebar) lists all rows.
+        let copies = match self.state.copies_in_dirs(effective_scope) {
             Ok(c) => c,
             Err(e) => {
                 ui.label(format!("copies read failed: {e}"));
@@ -1504,19 +1506,25 @@ where
     push(format!("normalize_dir failed for {}: {e}", p.display()));
 }
 
-/// Scope + search predicate shared between the page-render and the
-/// "`filtered_total`" count. Pure function; takes a `&StateDb` so it can
-/// dereference session renames for the search-narrow step without owning
-/// `App`.
+/// The directory set the History tab's scope filter applies to, or `None`
+/// when the filter is off (checkbox unchecked, or no loaded subtitle dirs)
+/// and every row should be shown. Shared by the sessions list and the
+/// copies foldout so both honor the same toggle.
+fn effective_scope_dirs(current_only: bool, scope_dirs: &[PathBuf]) -> Option<&[PathBuf]> {
+    if current_only && !scope_dirs.is_empty() { Some(scope_dirs) } else { None }
+}
+
+/// Search predicate for the sessions list; drives both the rendered page
+/// and the "`filtered_total`" count. Pure function; takes a `&StateDb` so
+/// it can dereference session renames for the search-narrow step without
+/// owning `App`.
 fn session_matches(
     db: &crate::core::state::StateDb,
     s: &crate::core::state::SessionRecord,
     view: &HistoryView,
-    scope_dirs: &[PathBuf],
-    scope_empty: bool,
+    effective_scope: Option<&[PathBuf]>,
 ) -> bool {
-    if view.scope_current_only
-        && !scope_empty
+    if let Some(scope_dirs) = effective_scope
         && let Some(dir) = &s.subtitle_dir
     {
         let canon = normalize_dir(Path::new(dir));

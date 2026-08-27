@@ -396,31 +396,45 @@ impl StateDb {
         Ok(rows)
     }
 
-    /// All copy events touching any of `dirs` on either side, ordered
-    /// newest-first. Used by the History popup's scope filter.
-    pub fn copies_in_dirs(&self, dirs: &[PathBuf]) -> Result<Vec<CopyRecord>> {
-        if dirs.is_empty() {
-            return Ok(Vec::new());
+    /// Copy events for the History tab, newest first (`at DESC, id DESC`).
+    /// `None` means no dir filtering — every row is returned;
+    /// `Some(dirs)` limits to events touching any listed dir on either
+    /// side. An empty `Some` slice yields nothing (callers pass `None`
+    /// via the shared scope helper when they want everything).
+    pub fn copies_in_dirs(&self, dirs: Option<&[PathBuf]>) -> Result<Vec<CopyRecord>> {
+        const COLS: &str = "id, at, src_dir, src_name, src_checksum,
+                            dst_dir, dst_name, dst_checksum, unit_id";
+        match dirs {
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare(&format!("SELECT {COLS} FROM copies ORDER BY at DESC, id DESC"))?;
+                let rows =
+                    stmt.query_map([], row_to_copy)?.collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            }
+            Some(dirs) if !dirs.is_empty() => {
+                let placeholders =
+                    std::iter::repeat_n("?", dirs.len()).collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "SELECT {COLS} FROM copies
+                     WHERE src_dir IN ({placeholders}) OR dst_dir IN ({placeholders})
+                     ORDER BY at DESC, id DESC"
+                );
+                let mut stmt = self.conn.prepare(&sql)?;
+                let params_vec: Vec<String> =
+                    dirs.iter().map(|p| p.display().to_string()).collect();
+                let second = params_vec.clone();
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params_from_iter(params_vec.iter().chain(second.iter())),
+                        row_to_copy,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            }
+            Some(_) => Ok(Vec::new()),
         }
-        let placeholders = std::iter::repeat_n("?", dirs.len()).collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT id, at,
-                    src_dir, src_name, src_checksum,
-                    dst_dir, dst_name, dst_checksum, unit_id
-             FROM copies
-             WHERE src_dir IN ({placeholders}) OR dst_dir IN ({placeholders})
-             ORDER BY at DESC, id DESC"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let params_vec: Vec<String> = dirs.iter().map(|p| p.display().to_string()).collect();
-        let second = params_vec.clone();
-        let rows = stmt
-            .query_map(
-                rusqlite::params_from_iter(params_vec.iter().chain(second.iter())),
-                row_to_copy,
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
     }
 }
 
@@ -899,6 +913,51 @@ mod tests {
         assert!(dir.join("state.db.bak-v4").exists(), ".bak-v4 snapshot must be written");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn copies_in_dirs_option_semantics() {
+        let (db, path) = tmp_db();
+        db.record_copy(
+            Path::new("/subs"),
+            "a.ass",
+            "c1",
+            Path::new("/videos"),
+            "A.ass",
+            "c1",
+            None,
+        )
+        .unwrap();
+        db.record_copy(
+            Path::new("/other"),
+            "b.ass",
+            "c2",
+            Path::new("/videos"),
+            "B.ass",
+            "c2",
+            None,
+        )
+        .unwrap();
+
+        // None: no filtering, every row.
+        let all = db.copies_in_dirs(None).unwrap();
+        assert_eq!(all.len(), 2);
+
+        // Some(dirs): rows touching any listed dir on EITHER side match.
+        let scoped = db.copies_in_dirs(Some(&[PathBuf::from("/videos")])).unwrap();
+        assert_eq!(scoped.len(), 2, "dst side matches too");
+        let only_subs = db.copies_in_dirs(Some(&[PathBuf::from("/subs")])).unwrap();
+        assert_eq!(only_subs.len(), 1);
+        assert_eq!(only_subs[0].src_name, "a.ass");
+        let multi =
+            db.copies_in_dirs(Some(&[PathBuf::from("/subs"), PathBuf::from("/other")])).unwrap();
+        assert_eq!(multi.len(), 2);
+
+        // Documented degenerate case: an empty Some slice yields nothing;
+        // callers that want everything pass None.
+        let empty: Vec<PathBuf> = Vec::new();
+        assert!(db.copies_in_dirs(Some(&empty)).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
